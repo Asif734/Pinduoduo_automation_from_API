@@ -51,7 +51,9 @@ final class PDDBackgroundVideoRecoveryTests: XCTestCase {
             ),
             recovered: true,
             failureHandler: { _ in await recorder.record() },
-            eventHandler: { _ in }
+            eventHandler: { event in
+                XCTAssertNotEqual(event.phase, .failed, "Durable handler controls retries and terminal failure")
+            }
         )
 
         let failureCount = await recorder.count()

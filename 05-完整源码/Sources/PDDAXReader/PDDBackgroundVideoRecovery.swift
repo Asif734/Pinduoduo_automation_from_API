@@ -99,11 +99,15 @@ enum PDDBackgroundVideoRecovery {
         } catch is CancellationError {
             return
         } catch {
-            await failureHandler?(error)
-            await eventHandler(.init(
-                uid: uid, messageID: messageID, phase: .failed,
-                diagnostic: error.localizedDescription
-            ))
+            if let failureHandler {
+                // The durable handler owns the retry budget and final failure.
+                await failureHandler(error)
+            } else {
+                await eventHandler(.init(
+                    uid: uid, messageID: messageID, phase: .failed,
+                    diagnostic: error.localizedDescription
+                ))
+            }
         }
     }
 }

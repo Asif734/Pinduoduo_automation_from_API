@@ -68,8 +68,8 @@ enum AutoReplyProgressPresentation {
                 : stageName(active.state))
             if active.state == .generating {
                 return BilingualText.lines(
-                    "\(active.uid) · \(stage.chinese) · CLI \(liveGenerationCount)",
-                    "\(active.uid) · \(stage.english) · CLI \(liveGenerationCount)"
+                    "\(active.uid) · \(stage.chinese) · API \(liveGenerationCount)",
+                    "\(active.uid) · \(stage.english) · API \(liveGenerationCount)"
                 )
             }
             return BilingualText.lines(
@@ -77,7 +77,7 @@ enum AutoReplyProgressPresentation {
                 "\(active.uid) · \(stage.english)"
             )
         }
-        if liveGenerationCount > 0 { return BilingualText.lines("Codex 后台处理中 · CLI \(liveGenerationCount)", "Codex is processing in the background · CLI \(liveGenerationCount)") }
+        if liveGenerationCount > 0 { return BilingualText.lines("托管 API 后台处理中 · \(liveGenerationCount)", "Hosted API processing in the background · \(liveGenerationCount)") }
         if let lastRuntimeIssue, !lastRuntimeIssue.isEmpty {
             return BilingualText.lines("错误后继续扫描 · \(lastRuntimeIssue)", "Continuing to scan after an error · \(lastRuntimeIssue)")
         }
@@ -110,7 +110,7 @@ enum AutoReplyProgressPresentation {
         case .discovered: return BilingualText.lines("已发现客户消息", "Customer message discovered")
         case .capturing: return BilingualText.lines("AX 正在读取；失效时才启用尾部 OCR", "Reading with AX; tail OCR is used only if AX fails")
         case .queued: return BilingualText.lines("已排队，等待生成回复", "Queued for reply generation")
-        case .generating: return BilingualText.lines("Codex 正在生成回复", "Codex is generating a reply")
+        case .generating: return BilingualText.lines("托管 API 正在生成回复", "The hosted API is generating a reply")
         case .ready: return BilingualText.lines("回复就绪，等待发送", "Reply ready; waiting to send")
         case .sending: return BilingualText.lines("正在发送并回读确认", "Sending and reading back for confirmation")
         case .completed: return BilingualText.lines("已完成", "Completed")
@@ -120,7 +120,33 @@ enum AutoReplyProgressPresentation {
         }
     }
 
-    static func jobStageName(_ job: AutoReplyJob) -> String {
+    static func jobStageName(_ job: AutoReplyJob, jobs: [AutoReplyJob] = []) -> String {
+        if job.lastError?.hasPrefix("等待人工转接 · ") == true {
+            return BilingualText.lines("托管生成失败 · 等待人工转接", "Hosted generation failed · Handoff queued")
+        }
+        if job.lastError?.hasPrefix("转接需人工核对 · ") == true {
+            return BilingualText.lines("转接需人工核对", "Handoff requires operator review")
+        }
+        if job.lastError?.hasPrefix("托管生成失败，已转人工 · ") == true {
+            return BilingualText.lines("已转人工客服", "Transferred to a human agent")
+        }
+        if job.lastError == CustomerFacingReplyPolicy.wordingBlockedMessage {
+            return BilingualText.lines("用语被拼多多拦截 · 请修改草稿", "Wording blocked · Edit draft")
+        }
+        if job.state == .queued || job.state == .generating,
+           job.lastError == PinduoduoV2ClientError.recoveryPending.errorDescription {
+            return BilingualText.lines("拼多多托管任务等待恢复", "Pinduoduo hosted recovery required")
+        }
+        if job.state == .queued, let blocking = jobs.first(where: {
+            $0.uid == job.uid && $0.sequence < job.sequence && [.queued, .generating].contains($0.state)
+                && $0.lastError == PinduoduoV2ClientError.recoveryPending.errorDescription
+        }) {
+            return BilingualText.lines("等待 #\(blocking.sequence) · 托管任务恢复中", "Waiting for #\(blocking.sequence) · Hosted recovery required")
+        }
+        if job.state == .quarantined,
+           job.lastError?.hasSuffix(" changed after synchronization") == true {
+            return BilingualText.lines("目标消息与已同步内容冲突 · 需核对", "Target message conflict · Review required")
+        }
         if job.deliveryOutcome == .uncertain { return stageName(.uncertain) }
         if job.omittedAt != nil {
             return BilingualText.lines("已省略 · 客户不可见超过10分钟", "Omitted · customer absent for 10 minutes")

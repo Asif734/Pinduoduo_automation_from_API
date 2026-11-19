@@ -3,6 +3,71 @@ import XCTest
 
 @MainActor
 final class PDDVideoTransferArmerTests: XCTestCase {
+    func testLiveCaptureDownloadsTargetVideoWithoutGeneratingOrSendingReply() async throws {
+        guard let messageID = ProcessInfo.processInfo.environment["PDD_LIVE_VIDEO_CAPTURE_MESSAGE_ID"] else {
+            throw XCTSkip("Set PDD_LIVE_VIDEO_CAPTURE_MESSAGE_ID for a capture-only local video check")
+        }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = LivePDDAXBackend()
+        let tree = try backend.readSemanticTree()
+        let candidate = try XCTUnwrap(PDDAXVideoSelection.customerVideos(in: tree.nodes, messageIDs: [messageID]).first)
+        let finished = expectation(description: "video capture reached evidence or retry")
+        let events = LiveVideoCaptureEvents()
+        let registry = PDDVideoTransferRegistry()
+        let armer = PDDVideoTransferArmer(destinationRoot: root, registry: registry,
+            analysisInbox: PDDVideoAnalysisInbox(stateURL: root.appendingPathComponent("hashes.json")),
+            speechTranscriber: PDDNoVideoSpeechTranscriber(),
+            eventHandler: { event in
+                await events.append(event)
+                print("CAPTURE-ONLY phase=\(event.phase.rawValue) \(event.diagnostic ?? "")")
+                if [.readyForGeneration, .waitingForRetry, .failed].contains(event.phase) { finished.fulfill() }
+            })
+        let coordinator = PDDVideoForegroundCoordinator(armer: armer,
+            opener: PDDAXVideoPreviewOpener(backend: backend))
+        _ = try await coordinator.begin(uid: "capture-only", candidates: [candidate],
+            lease: UIOperationLeaseRegistry().acquire(uid: "capture-only"))
+        await fulfillment(of: [finished], timeout: 120)
+        await registry.cancelAll()
+        let captured = await events.values
+        let attachment = try XCTUnwrap(captured.first { $0.phase == .readyForGeneration }?.attachment)
+        XCTAssertEqual(attachment.messageID, messageID)
+        XCTAssertFalse(attachment.frames.isEmpty)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: attachment.localURL.path))
+    }
+
+    func testThreeRetriesSurviveRestartThenAskProductProblemExactlyOnce() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let recorder = VideoOrderRecorder()
+        let url = root.appendingPathComponent("transfer-state.json")
+        let key = PDDVideoTransferKey(uid: "customer", messageID: "video")
+        // Recreate the armer and store on each failure to exercise restart durability.
+        for failure in 0..<5 {
+            let armer = PDDVideoTransferArmer(destinationRoot: root,
+                registry: PDDVideoTransferRegistry(),
+                analysisInbox: PDDVideoAnalysisInbox(stateURL: root.appendingPathComponent("hashes.json")),
+                stateStore: PDDDurableVideoTransferStore(url: url),
+                eventHandler: { recorder.append($0.phase.rawValue) })
+            await armer.reportFailure(uid: "customer", messageID: "video", error: PDDCustomerVideoError.clickFailed)
+            let store = PDDDurableVideoTransferStore(url: url)
+            let record = try await store.record(key)
+            if failure < 3 {
+                XCTAssertEqual(record?.phase, .waitingForRetry)
+                XCTAssertEqual(record?.retryIndex, failure + 1)
+                XCTAssertNotNil(record?.nextAttemptAt)
+                XCTAssertFalse(recorder.values.contains("fallbackRequired"))
+            } else {
+                XCTAssertEqual(record?.phase, .terminalFailure)
+                XCTAssertEqual(record?.retryIndex, 3)
+                XCTAssertNil(record?.nextAttemptAt)
+                let due = try await store.claimDueRecords()
+                XCTAssertTrue(due.isEmpty)
+            }
+        }
+        XCTAssertEqual(recorder.values, ["waitingForRetry", "waitingForRetry", "waitingForRetry", "failed", "fallbackRequired"])
+    }
+
     func testCancellationDoesNotCreateVideoFailureOrContinueToAnotherVideo() async throws {
         let recorder = VideoOrderRecorder()
         let armer = VideoArmerSpy(recorder: recorder)
@@ -108,7 +173,7 @@ final class PDDVideoTransferArmerTests: XCTestCase {
         XCTAssertEqual(armer.failedMessageIDs, ["v2"])
     }
 
-    func testRetriesPreviewOpenAtMostThreeTimesUntilItIsConfirmed() async throws {
+    func testMissingPreviewLabelsDoNotPreventAddressCapture() async throws {
         let recorder = VideoOrderRecorder()
         let armer = VideoArmerSpy(recorder: recorder)
         let opener = ConfirmingVideoPreviewOpenerSpy(
@@ -124,11 +189,8 @@ final class PDDVideoTransferArmerTests: XCTestCase {
             lease: UIOperationLeaseRegistry().acquire(uid: "PDD-one")
         )
 
-        XCTAssertEqual(opener.openCount, 3)
-        XCTAssertEqual(recorder.values, [
-            "arm", "open", "confirm-false", "open", "confirm-false",
-            "open", "confirm-true", "start", "close"
-        ])
+        XCTAssertEqual(opener.openCount, 1)
+        XCTAssertEqual(recorder.values, ["arm", "open", "start", "close"])
         XCTAssertTrue(armer.failedMessageIDs.isEmpty)
     }
 
@@ -149,10 +211,10 @@ final class PDDVideoTransferArmerTests: XCTestCase {
         )
 
         XCTAssertEqual(opener.openCount, 1)
-        XCTAssertEqual(recorder.values, ["arm", "open", "confirm-true", "start", "close"])
+        XCTAssertEqual(recorder.values, ["arm", "open", "start", "close"])
     }
 
-    func testThreeUnconfirmedClicksFallBackWithoutStartingAddressWait() async throws {
+    func testAllPreviewProbesFalseStillWaitsForLinkWithoutFallback() async throws {
         let recorder = VideoOrderRecorder()
         let armer = VideoArmerSpy(recorder: recorder)
         let opener = ConfirmingVideoPreviewOpenerSpy(
@@ -168,11 +230,16 @@ final class PDDVideoTransferArmerTests: XCTestCase {
             lease: UIOperationLeaseRegistry().acquire(uid: "PDD-one")
         )
 
-        XCTAssertEqual(pending, ["v1"], "the empty video must remain in the Codex batch")
-        XCTAssertEqual(opener.openCount, 3)
-        XCTAssertFalse(recorder.values.contains("start"), "link waiting must not start before preview confirmation")
-        XCTAssertEqual(armer.failedMessageIDs, ["v1"], "existing fallback path must receive the empty video")
+        XCTAssertEqual(pending, ["v1"])
+        XCTAssertEqual(opener.openCount, 1)
+        XCTAssertTrue(recorder.values.contains("start"))
+        XCTAssertTrue(armer.failedMessageIDs.isEmpty)
     }
+}
+
+private actor LiveVideoCaptureEvents {
+    var values: [PDDVideoTransferEvent] = []
+    func append(_ event: PDDVideoTransferEvent) { values.append(event) }
 }
 
 @MainActor

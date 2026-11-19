@@ -182,6 +182,15 @@ final class PDDLiveAutoReplyDriver: AutoReplyAutomationDriver {
         try await withLease(lease) { try await conversationDriver.discover() }
     }
 
+    func transferHostedFailure(uid: String, expectedCustomerMessageIDs: Set<String>,
+                               lease: UIOperationLease) async throws -> AutoReplyTransferResult {
+        guard let transferer else { return .failed("当前驱动未配置转人工执行器") }
+        return try await withLease(lease) {
+            try await transferer.transferHostedFailure(uid: uid,
+                expectedCustomerMessageIDs: expectedCustomerMessageIDs, lease: lease)
+        }
+    }
+
     func capture(
         uid: String, after cursor: AutoReplyCursor, lease: UIOperationLease
     ) async throws -> AutoReplyCapture {

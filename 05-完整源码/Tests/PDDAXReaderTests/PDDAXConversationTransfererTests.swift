@@ -3,6 +3,33 @@ import XCTest
 
 @MainActor
 final class PDDAXConversationTransfererTests: XCTestCase {
+    func testHostedFailureRequiresLiveTargetAndStopsAfterAServiceReply() async throws {
+        func message(_ id: String, _ sender: String) -> AXNodeSnapshot {
+            .init(role: "AXGroup", attributes: [("AXDOMClassList", "[onemsg]"), ("AXDOMIdentifier", id)], children: [
+                .init(role: "AXGroup", attributes: [("AXDOMClassList", "[\(sender)]")], children: [
+                    .init(role: "AXStaticText", attributes: [("AXDOMClassList", "[msg-content-box]"), ("AXValue", "message")])])])
+        }
+        let target = "middlePanel_list_1"
+        let current = PDDAXSemanticTree(rootSnapshot: .init(role: "AXWindow", children: [
+            message(target, "buyer-item"), message("middlePanel_list_2", "cs-item")
+        ]), nodes: chatTree().nodes)
+        let backend = TransferBackendStub(tree: current)
+        let clicker = TransferClickerSpy()
+        let transferer = PDDAXConversationTransferer(backend: backend,
+            opener: TransferOpenerStub(tree: current), clicker: clicker, sleep: { _ in })
+        let lease = UIOperationLeaseRegistry().acquire(uid: "customer")
+        do {
+            _ = try await transferer.transferHostedFailure(uid: "customer",
+                expectedCustomerMessageIDs: ["middlePanel_list_missing"], lease: lease)
+            XCTFail("A missing target must stay unverified")
+        } catch { XCTAssertTrue(error is PDDTransferPrecommitError) }
+        let result = try await transferer.transferHostedFailure(uid: "customer",
+            expectedCustomerMessageIDs: [target], lease: lease)
+        XCTAssertEqual(result, .failed("待转接消息之后已有客服回复；请人工核对是否仍需转接"))
+        XCTAssertTrue(clicker.clickedPoints.isEmpty)
+        XCTAssertTrue(backend.pressedIDs.isEmpty)
+    }
+
     func testMissedOpeningClickBringsWindowForwardAndRelocatesBeforeRetry() async throws {
         let backend = TransferBackendStub(tree: chatTree())
         let opener = TransferOpenerStub(tree: chatTree())

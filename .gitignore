@@ -51,9 +51,21 @@ installed-app-backups/
 05-完整源码/.knowledge-hf-cache/
 .coverage
 
-# Local customer-service databases and their original media (distributed separately)
+# Obsolete local customer-service databases and their original media
 /格志京东客服知识库-*/
 /格志中国市场客服完整知识库-*/
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3-journal
 
 # Runtime installation archives; retain notices and checksum manifests
 /05-完整源码/Resources/ThirdParty/PythonRuntime/*.tar.gz
@@ -61,6 +73,6 @@ installed-app-backups/
 /05-完整源码/Resources/ThirdParty/PythonRuntime/*.zip
 
 # Local runtime records and diagnostic exports
-/:memory:.ses
+:memory:.ses
 *.crash
 *.trace

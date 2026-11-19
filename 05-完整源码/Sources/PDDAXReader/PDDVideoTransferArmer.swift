@@ -119,25 +119,26 @@ struct PDDVideoForegroundCoordinator {
         guard let armed = try await armer.arm(
             uid: uid, messageID: candidate.messageID, candidate: candidate
         ) else { return }
-        var confirmed = false
+        var clicked = false
         var lastOpenError: Error?
         for _ in 0..<3 {
             do {
                 try lease.validate()
                 try await opener.open(candidate, lease: lease)
-                if try await opener.waitUntilOpen() {
-                    confirmed = true
-                    break
-                }
+                clicked = true
+                break
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
                 lastOpenError = error
             }
         }
-        guard confirmed else {
+        guard clicked else {
             throw lastOpenError ?? PDDCustomerVideoError.clickFailed
         }
+        // A posted click can load the video without exposing the expected AX
+        // preview labels. The matching cache URL is the capture evidence; do not
+        // block the watcher or toggle an already-open preview by clicking again.
         await armed.startAndWaitUntilAddressCaptured()
         do {
             try lease.validate()
@@ -344,29 +345,25 @@ final class PDDVideoTransferArmer: PDDVideoTransferArming {
         let category = PDDVideoTransferFailureCategory.classify(error)
         let detail = PDDVideoTransferFailureCategory.diagnostic(error)
         let record = try? await stateStore.record(key)
+        guard record?.phase != .terminalFailure else { return }
         if let delay = PDDVideoRetryPolicy.delay(afterFailure: record?.retryIndex ?? 0) {
-            try? await stateStore.scheduleRetry(
-                key: key, category: category,
-                nextAttemptAt: Date().addingTimeInterval(delay), failureDetail: detail
-            )
-            await eventHandler(.init(
-                uid: uid, messageID: messageID, phase: .waitingForRetry,
-                diagnostic: "category=\(category.rawValue) cause=\(detail) retry_in=\(Int(delay))s"
-            ))
-        } else {
-            try? await stateStore.transition(
-                key: key, to: .terminalFailure, failure: .retryBudgetExhausted,
-                failureDetail: detail
-            )
-            await eventHandler(.init(
-                uid: uid, messageID: messageID, phase: .failed,
-                diagnostic: "视频下载重试已用完 category=\(category.rawValue) cause=\(detail)"
-            ))
+            try? await stateStore.scheduleRetry(key: key, category: category,
+                nextAttemptAt: Date().addingTimeInterval(delay), failureDetail: detail)
+            await eventHandler(.init(uid: uid, messageID: messageID, phase: .waitingForRetry,
+                diagnostic: "category=\(category.rawValue) cause=\(detail); retry=\((record?.retryIndex ?? 0) + 1)/\(PDDVideoRetryPolicy.maximumRetries) retry_in=\(Int(delay))s"))
+            return
         }
+        try? await stateStore.transition(
+            key: key, to: .terminalFailure, failure: category, failureDetail: detail
+        )
+        await eventHandler(.init(
+            uid: uid, messageID: messageID, phase: .failed,
+            diagnostic: "category=\(category.rawValue) cause=\(detail); maximum 3 retries exhausted; ask product problem"
+        ))
         if (try? await stateStore.markFallbackEmitted(key: key)) == true {
             await eventHandler(.init(
                 uid: uid, messageID: messageID, phase: .fallbackRequired,
-                diagnostic: "亲，视频暂时无法加载，麻烦您先简单描述一下需要我们查看的问题。"
+                diagnostic: "请问您的产品遇到了什么问题？麻烦您描述一下具体表现，我来帮您排查。"
             ))
         }
     }

@@ -6,7 +6,7 @@ enum ReaderWorkflowStage: String, Equatable, Sendable {
     case saveAX = "保存 AX"
     case parseChat = "解析聊天"
     case mergeHistory = "合并历史"
-    case codex = "生成 Codex 建议"
+    case codex = "生成托管 API 建议"
 }
 
 struct ReaderWorkflowError: LocalizedError {
@@ -49,16 +49,7 @@ struct ReaderWorkflowDependencies: @unchecked Sendable {
             parseChat: { root, capturedAt in PDDChatParser.parse(root: root, capturedAt: capturedAt) },
             mergeHistory: { uid, messages in try chatStore.merge(uid: uid, messages: messages) },
             generateReply: { uid, history in
-                let localKnowledge = DirectLocalKnowledge()
-                try localKnowledge.validate()
-                guard let executable = CodexInstallation.resolve() else {
-                    throw AutoReplyRuntimeCreationError.codexUnavailable
-                }
-                let generator = AutoReplyCodexGenerator(
-                    executableURL: executable,
-                    sessionRegistry: CodexSessionRegistry(rootDirectory: rootDirectory),
-                    evidencePreparer: localKnowledge
-                )
+                let generator = PinduoduoV2ReplyGenerator(rootDirectory: rootDirectory)
                 do {
                     let timeline = try AutoReplyTimeline.make(messages: history)
                     let answeredHistory = history.lastIndex(where: { $0.sender == .service })
@@ -68,7 +59,7 @@ struct ReaderWorkflowDependencies: @unchecked Sendable {
                         uid: uid, fullHistory: history, batch: try timeline.freeze(after: answeredCursor),
                         customerCursor: timeline.cursor, unexpectedServiceMessageIDs: []
                     )
-                    let result = try await generator.generate(capture)
+                    let result = try await generator.generate(jobID: UUID(), capture: capture)
                     return result
                 } catch {
                     throw error

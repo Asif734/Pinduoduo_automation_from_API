@@ -22,6 +22,7 @@ struct CodexReplyResult: Equatable, Sendable {
     var action: CodexReplyAction = .reply
     var transferReason: CodexTransferReason = .none
     var outgoingImages: [DatasetReplyImage] = []
+    var hostedGeneration: PinduoduoV2GenerationReceipt? = nil
 }
 
 enum CodexReplyServiceError: LocalizedError {

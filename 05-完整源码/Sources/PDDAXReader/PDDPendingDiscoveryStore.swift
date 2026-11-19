@@ -17,6 +17,7 @@ struct PDDPendingDiscovery: Codable, Equatable, Identifiable {
     var signalSignature: String? = nil
     var transferOnly: Bool? = nil
     var previewTexts: [String]? = nil
+    var identityConflictAt: Date? = nil
 
     init(locator: PDDConversationLocator, occurrence: Int, unread: Bool, at date: Date) {
         id = UUID(); self.locator = locator; self.occurrence = occurrence
@@ -75,6 +76,7 @@ struct PDDPendingDiscoveryStore {
     static func retain(locator: PDDConversationLocator, occurrence: Int, unread: Bool,
                        at date: Date, in tasks: inout [PDDPendingDiscovery]) -> UUID {
         if let index = tasks.firstIndex(where: { task in
+            guard task.identityConflictAt == nil else { return false }
             if let id = locator.normalizedIdentifier, let old = task.locator.normalizedIdentifier {
                 return id == old
             }

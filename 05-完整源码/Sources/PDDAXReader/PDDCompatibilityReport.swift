@@ -28,6 +28,7 @@ enum PDDCompatibilityKind: String, Codable, Equatable, Sendable {
     case python
     case knowledge
     case codex
+    case api
     case videoCache
 }
 
@@ -43,6 +44,7 @@ extension PDDCompatibilityKind {
         case .python: return "Python"
         case .knowledge: return "知识库"
         case .codex: return "Codex"
+        case .api: return "拼多多 V2 API"
         case .videoCache: return "视频缓存"
         }
     }
@@ -58,6 +60,7 @@ extension PDDCompatibilityKind {
         case .python: return "Python"
         case .knowledge: return "Knowledge base"
         case .codex: return "Codex"
+        case .api: return "Pinduoduo V2 API"
         case .videoCache: return "Video cache"
         }
     }

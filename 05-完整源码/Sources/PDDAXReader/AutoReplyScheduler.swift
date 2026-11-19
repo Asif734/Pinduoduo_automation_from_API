@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 struct AutoReplyDiscovery: Equatable, Sendable {
@@ -10,12 +11,20 @@ enum AutoReplyDeliveryResult: Equatable, Sendable {
     case sent(serviceMessageID: String)
     case failedBeforeSend(String)
     case discardedBeforeSend(String)
+    case wordingRejected
     case uncertain(String)
 }
 
 enum AutoReplyTransferResult: Equatable, Sendable {
     case transferred(agentLabel: String)
     case failed(String)
+}
+
+enum AutoReplyJobDeletionError: LocalizedError {
+    case unavailable
+    var errorDescription: String? {
+        "任务正在发送、转接或发送结果尚未核对，暂不能删除 / Task is sending, transferring, or awaiting delivery verification"
+    }
 }
 
 @MainActor
@@ -46,6 +55,8 @@ protocol AutoReplyAutomationDriver: AnyObject {
     func transferToAnyHuman(
         uid: String, lease: UIOperationLease
     ) async throws -> AutoReplyTransferResult
+    func transferHostedFailure(uid: String, expectedCustomerMessageIDs: Set<String>,
+                               lease: UIOperationLease) async throws -> AutoReplyTransferResult
     func discover(lease: UIOperationLease) async throws -> [AutoReplyDiscovery]
     func capture(
         uid: String, after cursor: AutoReplyCursor, lease: UIOperationLease
@@ -89,6 +100,10 @@ protocol AutoReplyAutomationDriver: AnyObject {
 }
 
 extension AutoReplyAutomationDriver {
+    func transferHostedFailure(uid: String, expectedCustomerMessageIDs: Set<String>,
+                               lease: UIOperationLease) async throws -> AutoReplyTransferResult {
+        .failed("驱动无法核对托管失败批次的转接目标")
+    }
     var supportsTextDeliveryTracking: Bool { false }
     func reconcileTextDelivery(uid: String, text: String, deliveryID: UUID,
         expectedCustomerMessageIDs: Set<String>, lease: UIOperationLease) async throws -> AutoReplyDeliveryResult {
@@ -213,6 +228,14 @@ protocol AutoReplyGenerating: Sendable {
     func generate(_ capture: AutoReplyCapture) async throws -> CodexReplyResult
 }
 
+protocol DurableJobAutoReplyGenerating: AutoReplyGenerating {
+    func generate(jobID: UUID, capture: AutoReplyCapture) async throws -> CodexReplyResult
+}
+
+protocol AutoReplyGenerationPolicyProviding: Sendable {
+    var serializesGenerationBehindActiveDelivery: Bool { get }
+}
+
 @MainActor
 final class AutoReplyScheduler: ObservableObject {
     var onStateChange: (@MainActor () -> Void)?
@@ -239,6 +262,7 @@ final class AutoReplyScheduler: ObservableObject {
 
     private let driver: any AutoReplyAutomationDriver
     private let generator: any AutoReplyGenerating
+    private let hostedDeliveryRecorder: (any PinduoduoV2DeliveryRecording)?
     private let store: AutoReplyStore
     private let transactionalStore: AutoReplyTransactionalStore
     private let concurrencyPolicy: AdaptiveConcurrencyPolicy
@@ -265,6 +289,7 @@ final class AutoReplyScheduler: ObservableObject {
     private var pendingFastDiscoveryAttempts = 0
     private var ordinaryCaptureAuthorizations = Set<String>()
     private var ordinaryCaptureFailureCounts: [String: Int] = [:]
+    private var verifiedSubmissionPrefixes: [String: (cursor: AutoReplyCursor, messageIDs: Set<String>)] = [:]
     private var pumping = false
     private var identityRecoveryBlockedUIDs = Set<String>()
     private var identityRecoveryRetryAt: [String: Date] = [:]
@@ -274,6 +299,7 @@ final class AutoReplyScheduler: ObservableObject {
     init(
         driver: any AutoReplyAutomationDriver,
         generator: any AutoReplyGenerating,
+        hostedDeliveryRecorder: (any PinduoduoV2DeliveryRecording)? = nil,
         store: AutoReplyStore,
         configuredMaximumConcurrentGenerations: Int? = nil,
         physicalMemoryBytes: UInt64 = ProcessInfo.processInfo.physicalMemory,
@@ -289,6 +315,7 @@ final class AutoReplyScheduler: ObservableObject {
     ) throws {
         self.driver = driver
         self.generator = generator
+        self.hostedDeliveryRecorder = hostedDeliveryRecorder
         self.store = store
         self.transactionalStore = AutoReplyTransactionalStore(rootDirectory: store.rootDirectory)
         self.configuredMaximumConcurrentGenerations = configuredMaximumConcurrentGenerations
@@ -325,6 +352,9 @@ final class AutoReplyScheduler: ObservableObject {
         driver.restoreMessageSourceSelectorStates(state.messageSourceSelectorStatesByUID)
         var migratedBlockingState = PDDConversationIdentityRecovery.retireSupersededHandoffs(
             in: &state, root: store.rootDirectory, at: now())
+        if try PDDVideoFallbackRecovery.settleSentFallbacks(in: &state, root: store.rootDirectory, at: now()) {
+            migratedBlockingState = true
+        }
         for index in state.jobs.indices {
             guard state.jobs[index].state == .completed,
                   state.jobs[index].deliveryOutcome == .uncertain,
@@ -348,8 +378,69 @@ final class AutoReplyScheduler: ObservableObject {
            (state.answeredCursors[latestJob.uid]?.count ?? 0) > batch.endCursor.count {
             state.answeredCursors[latestJob.uid] = batch.endCursor
         }
+        let hostedOutbox = PinduoduoV2GenerationOutboxStore(rootDirectory: store.rootDirectory)
+        for index in state.jobs.indices where state.jobs[index].state == .queued && state.jobs[index].lastError == nil {
+            let queued = state.jobs[index]
+            if let record = try? hostedOutbox.load(queued.id), record.phase == .recoveryRequired,
+               record.customerUid == queued.uid, record.hostedJobID != nil {
+                state.jobs[index].lastError = PinduoduoV2ClientError.recoveryPending.errorDescription
+                migratedBlockingState = true
+            }
+        }
+        var hostedRecoveryWinners = Set<UUID>()
+        var hostedRecoveryDuplicates = Set<UUID>()
+        var hostedTerminalFailures = Set<UUID>()
+        var hostedRecoverySignatures = Set<String>()
+        for job in state.jobs.sorted(by: { $0.sequence < $1.sequence }) {
+            guard job.state == .quarantined,
+                  job.deliveryOutcome != .sent,
+                  let record = try? hostedOutbox.load(job.id),
+                  record.customerUid == job.uid,
+                  record.localJobID == job.id else { continue }
+            switch record.phase {
+            case .failed, .expired:
+                // These are unresolved unsent messages, not answered cursors.
+                // Keep the actual hosted error visible instead of applying the
+                // legacy migration that silently skips a customer's batch.
+                hostedTerminalFailures.insert(job.id)
+                continue
+            case .frozen, .accepted, .completed, .recoveryRequired:
+                break
+            }
+            let targets = job.capture.batch?.customerMessageIDs.sorted() ?? []
+            let signature = ([job.uid] + targets).joined(separator: "\u{1f}")
+            if hostedRecoverySignatures.insert(signature).inserted {
+                hostedRecoveryWinners.insert(job.id)
+            } else {
+                hostedRecoveryDuplicates.insert(job.id)
+            }
+        }
+        for index in state.jobs.indices where hostedRecoveryWinners.contains(state.jobs[index].id) {
+            state.jobs[index].state = .queued
+            state.jobs[index].deliveryOutcome = .notSent
+            state.jobs[index].reply = nil
+            state.jobs[index].outgoingImages = []
+            state.jobs[index].retries = 0
+            state.jobs[index].nextAttemptAt = nil
+            state.jobs[index].lastError = "已使用原始冻结请求与幂等键恢复托管生成"
+            migratedBlockingState = true
+        }
+        for index in state.jobs.indices where hostedRecoveryDuplicates.contains(state.jobs[index].id) {
+            state.jobs[index].state = .failed
+            state.jobs[index].deliveryOutcome = .notSent
+            state.jobs[index].nextAttemptAt = nil
+            state.jobs[index].lastError = "相同客户批次已由更早的冻结幂等请求恢复；本地重复任务不会发送"
+            if state.jobs[index].pendingSupplement != nil {
+                _ = state.advanceSourceAndPromoteSupplement(at: index, advanceCursor: false)
+            }
+            migratedBlockingState = true
+        }
         for index in state.jobs.indices
-        where [.uncertain, .quarantined].contains(state.jobs[index].state) {
+        where [.uncertain, .quarantined].contains(state.jobs[index].state)
+            && !hostedRecoveryWinners.contains(state.jobs[index].id)
+            && !hostedRecoveryDuplicates.contains(state.jobs[index].id)
+            && !hostedTerminalFailures.contains(state.jobs[index].id)
+            && !Self.isLocalHistoryConflict(state.jobs[index]) {
             state.jobs[index].state = .failed
             state.jobs[index].deliveryOutcome = .notSent
             state.jobs[index].lastError = "旧阻塞状态已解除；已跳过当前批次并继续"
@@ -402,6 +493,9 @@ final class AutoReplyScheduler: ObservableObject {
                 step: "unsent-lookup-recovered", detail: "source=\(job.id) retry=\(recovered.id) sequence=\(recovered.sequence)")
             migratedBlockingState = true
         }
+        jobs = state.jobs
+        if recoverHostedTimestampConflicts() { migratedBlockingState = true }
+        if restoreHostedFailureTransfers() { migratedBlockingState = true }
         if migratedBlockingState { try store.save(state) }
         checkpointToken = try transactionalStore.loadCheckpoint().token
         jobs = state.jobs
@@ -467,6 +561,105 @@ final class AutoReplyScheduler: ObservableObject {
 
     func setDeliveryEnabled(_ enabled: Bool) { deliveryEnabled = enabled }
 
+    func canDeleteJob(_ id: UUID) -> Bool {
+        guard let job = state.jobs.first(where: { $0.id == id }),
+              job.state != .sending, job.state != .uncertain,
+              job.deliveryOutcome != .uncertain,
+              !job.sendWasInvoked || job.deliveryOutcome == .sent,
+              currentUIOwner == nil, !pumping,
+              job.outgoingImages.isEmpty || job.stageAttempt == 0 || job.deliveryOutcome == .sent
+        else { return false }
+        do {
+            let checkpoint = try PDDTextDeliveryAttemptStore(root: store.rootDirectory).load(id)
+            return checkpoint?.mayHaveSent != true || job.deliveryOutcome == .sent
+        } catch { return false }
+    }
+
+    /// Archives queue work only. Chat history and delivery evidence are retained.
+    func deleteJob(_ id: UUID) throws {
+        guard canDeleteJob(id), let selected = state.jobs.first(where: { $0.id == id }) else {
+            throw AutoReplyJobDeletionError.unavailable
+        }
+        guard try transactionalStore.loadCheckpoint().token == checkpointToken else {
+            throw AutoReplyTransactionalStoreError.checkpointChanged
+        }
+        let registry = PDDConversationIdentityStore(root: store.rootDirectory)
+        let canonical = try registry.canonicalUID(selected.uid)
+        let aliases = try registry.aliases()
+        let relatedUIDs = Set(aliases.filter { $0.value == canonical }.map(\.key)).union([canonical, selected.uid])
+        func targetIDs(_ job: AutoReplyJob) -> Set<String> {
+            var ids = Set(job.imageAttachments.map(\.messageID)).union(job.videoAttachments.map(\.messageID))
+            for capture in [job.capture] + (job.pendingSupplement.map { [$0] } ?? []) {
+                ids.formUnion(capture.batch?.events.map(\.messageID) ?? [])
+                ids.formUnion(capture.imageAttachments.map(\.messageID))
+                ids.formUnion(capture.videoAttachments.map(\.messageID))
+                ids.formUnion(capture.pendingVideoMessageIDs)
+            }
+            return ids
+        }
+        let selectedIDs = targetIDs(selected)
+        var stillOwned = Set<String>()
+        for job in state.jobs where job.id != id {
+            guard try registry.canonicalUID(job.uid) == canonical,
+                  [.discovered, .capturing, .queued, .generating, .ready, .sending, .uncertain].contains(job.state)
+                    || job.deliveryOutcome == .uncertain else { continue }
+            stillOwned.formUnion(targetIDs(job))
+        }
+        let dismissed = selectedIDs.subtracting(stillOwned)
+        let directory = store.rootDirectory.appendingPathComponent("archive/manual-deletions", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let archive = directory.appendingPathComponent("\(id.uuidString).json")
+        if !FileManager.default.fileExists(atPath: archive.path) {
+            try JSONEncoder().encode(selected).write(to: archive, options: .atomic)
+        }
+        let before = state
+        state.jobs.removeAll { $0.id == id }
+        state.manuallyDeletedMessageIDsByUID[canonical, default: []].formUnion(dismissed)
+        state.pendingCaptureRequests.removeAll {
+            $0.sourceJobID == id || ($0.uid == selected.uid && $0.kind == .tail
+                && $0.baseCursor == selected.capture.batch?.endCursor && stillOwned.isEmpty)
+                || (relatedUIDs.contains($0.uid) && $0.videoMessageID.map { dismissed.contains($0) } == true)
+        }
+        for index in state.transferTasks.indices where state.transferTasks[index].sourceJobID == id
+            && state.transferTasks[index].state == .pending {
+            state.transferTasks[index].state = .failed
+        }
+        state.pendingVideoBatches = state.pendingVideoBatches.compactMap { pending in
+            guard relatedUIDs.contains(pending.uid) else { return pending }
+            guard let remaining = captureByRemovingMessages(pending.capture, messageIDs: dismissed) else { return nil }
+            return PDDPendingVideoBatch(id: pending.id, uid: pending.uid, capture: remaining,
+                expectedMessageIDs: pending.expectedMessageIDs.filter { !dismissed.contains($0) },
+                completedAttachmentsByMessageID: pending.completedAttachmentsByMessageID.filter { !dismissed.contains($0.key) },
+                failedMessageIDs: pending.failedMessageIDs.subtracting(dismissed),
+                duplicateMessageIDs: pending.duplicateMessageIDs.subtracting(dismissed), createdAt: pending.createdAt)
+        }
+        state.deferredVideoTransferEvents.removeAll { relatedUIDs.contains($0.uid) && dismissed.contains($0.messageID) }
+        for index in state.videoHoldingNotices.indices where relatedUIDs.contains(state.videoHoldingNotices[index].uid)
+            && state.videoHoldingNotices[index].attemptedAt == nil {
+            state.videoHoldingNotices[index].messageIDs.subtract(dismissed)
+        }
+        state.videoHoldingNotices.removeAll { $0.messageIDs.isEmpty && $0.attemptedAt == nil }
+        appendEvent(uid: selected.uid, kind: "queue-task-manually-deleted",
+            detail: "job=\(id) sequence=\(selected.sequence); archived; no delivery receipt created")
+        do { try persist(sendCritical: true) }
+        catch { state = before; syncJobs(); throw error }
+        generationAttempts.removeValue(forKey: id)
+        liveGenerationJobIDs.remove(id)
+        generationTasks.removeValue(forKey: id)?.cancel()
+        identityRecoveryRetryAt.removeAll()
+        identityRecoveryBlockedUIDs.removeAll()
+        syncJobs()
+        onStateChange?()
+    }
+
+    private func manuallyDeletedMessageIDs(uid: String) -> Set<String> {
+        let registry = PDDConversationIdentityStore(root: store.rootDirectory)
+        let canonical = (try? registry.canonicalUID(uid)) ?? uid
+        return state.manuallyDeletedMessageIDsByUID.reduce(into: Set<String>()) { ids, entry in
+            if ((try? registry.canonicalUID(entry.key)) ?? entry.key) == canonical { ids.formUnion(entry.value) }
+        }
+    }
+
     func reconcileVisibleIdentity(in tree: PDDAXSemanticTree) throws {
         guard !isRunning, !pumping else { return }
         guard try transactionalStore.loadCheckpoint().token == checkpointToken else {
@@ -494,6 +687,7 @@ final class AutoReplyScheduler: ObservableObject {
     var pendingVideoBatchesSnapshot: [PDDPendingVideoBatch] { state.pendingVideoBatches }
 
     func requestVideoRecovery(uid: String, messageID: String) {
+        guard !manuallyDeletedMessageIDs(uid: uid).contains(messageID) else { return }
         guard !state.jobs.contains(where: { job in
             job.uid == uid && job.omittedAt != nil
                 && (job.capture.batch?.events.contains { $0.messageID == messageID } ?? false)
@@ -520,15 +714,20 @@ final class AutoReplyScheduler: ObservableObject {
     }
 
     func receiveVideoTransferEvent(_ event: PDDVideoTransferEvent) async {
+        guard !manuallyDeletedMessageIDs(uid: event.uid).contains(event.messageID) else { return }
         if let closed = try? await CustomerTransferPolicyStore.shared.closedMessageIDs(root: store.rootDirectory, uid: event.uid),
            closed.contains(event.messageID) {
             appendEvent(uid: event.uid, kind: "video-closed-message-ignored", detail: event.messageID)
             try? persist()
             return
         }
+        guard !manuallyDeletedMessageIDs(uid: event.uid).contains(event.messageID) else { return }
         latestVideoStatus = PDDVideoProgressStatus(event: event)
         if [.waitingForAddress, .downloading, .downloaded, .preparingEvidence, .readyForGeneration].contains(event.phase) {
-            registerVideoHold(uid: event.uid, messageIDs: [event.messageID])
+            registerVideoHold(
+                uid: event.uid,
+                messageIDs: recentVideoMessageIDs(uid: event.uid, candidates: [event.messageID])
+            )
         }
         onStateChange?()
         appendEvent(
@@ -575,7 +774,10 @@ final class AutoReplyScheduler: ObservableObject {
                 }
                 state.pendingVideoBatches[index]
                     .completedAttachmentsByMessageID[event.messageID] = attachment
-            case .failed, .fallbackRequired, .waitingForRetry:
+            case .fallbackRequired, .waitingForRetry:
+                continue
+            case .failed:
+                // Only exhausted retries resolve the batch as a failed video.
                 guard state.pendingVideoBatches[index]
                     .completedAttachmentsByMessageID[event.messageID] == nil,
                       !state.pendingVideoBatches[index].duplicateMessageIDs.contains(event.messageID)
@@ -705,13 +907,6 @@ final class AutoReplyScheduler: ObservableObject {
                     try await deliverPriorityReply(at: readyIndex)
                     return
                 }
-                if lane == 0, let index = nextDeliveryReconciliationIndex() {
-                    nextWorkLane = 1
-                    consecutiveSendTurns = 0
-                    workTurnsSinceDiscovery += 1
-                    try await reconcileDelivery(at: index)
-                    return
-                }
                 if lane == 1, let transferIndex = nextPendingTransferTaskIndex() {
                     nextWorkLane = 2
                     consecutiveSendTurns = 0
@@ -731,6 +926,9 @@ final class AutoReplyScheduler: ObservableObject {
             let discoveryInterval = pendingFastDiscoveryAttempts > 0 ? 0.2 : 1.0
             if now().timeIntervalSince(lastDiscoveryAt) >= discoveryInterval {
                 try await performDiscovery()
+            } else if let index = nextDeliveryReconciliationIndex() {
+                // Checking an old receipt should not delay new conversation work.
+                try await reconcileDelivery(at: index)
             }
             lastRuntimeIssue = nil
         } catch {
@@ -743,6 +941,179 @@ final class AutoReplyScheduler: ObservableObject {
                 recordPersistenceFailure(error, sendCritical: false)
             }
         }
+    }
+
+    /// A server-confirmed timestamp rejection permits one corrected task.
+    /// Pending/uncertain requests retain their original keys and are excluded.
+    @discardableResult
+    private func recoverHostedTimestampConflicts() -> Bool {
+        var changed = false
+        for index in state.jobs.indices {
+            let source = state.jobs[index]
+            guard source.state == .quarantined else { continue }
+            do {
+                let targets = source.capture.batch?.customerMessageIDs ?? []
+                let identities = PDDConversationIdentityStore(root: store.rootDirectory)
+                let canonical = try identities.canonicalUID(source.uid)
+                let receipts = CustomerMessageReceipts(root: store.rootDirectory)
+                var alreadyHandled = Set<String>()
+                for uid in Set([source.uid, canonical]) {
+                    alreadyHandled.formUnion(try receipts.receipts(uid: uid).filter {
+                        $0.value.replySentAt != nil || $0.value.closedAt != nil
+                    }.map(\.key))
+                }
+                guard !targets.isEmpty, targets.isDisjoint(with: alreadyHandled) else { continue }
+                let overlapping = try state.jobs.contains { other in
+                    guard other.id != source.id, try identities.canonicalUID(other.uid) == canonical else { return false }
+                    let ids = (other.capture.batch?.customerMessageIDs ?? [])
+                        .union(other.pendingSupplement?.batch?.customerMessageIDs ?? [])
+                    guard !ids.isDisjoint(with: targets) else { return false }
+                    return [.queued, .generating, .ready, .sending, .quarantined, .uncertain].contains(other.state)
+                        || other.deliveryOutcome == .sent || other.deliveryOutcome == .uncertain
+                }
+                guard !overlapping else { continue }
+                guard let id = try PinduoduoV2TimestampRepair.replacement(for: source, root: store.rootDirectory) else { continue }
+                if !state.jobs.contains(where: { $0.id == id }) {
+                    state.nextSequence += 1
+                    state.jobs.append(.init(id: id, uid: source.uid, sequence: state.nextSequence, state: .queued,
+                        capture: source.capture, reply: nil, deliveryOutcome: .notSent,
+                        confirmedServiceMessageID: nil, retries: 0, nextAttemptAt: nil, lastError: nil))
+                }
+                state.jobs[index].state = .failed
+                state.jobs[index].supersededByJobID = id
+                state.jobs[index].nextAttemptAt = nil
+                state.jobs[index].lastError = "时间戳冲突已依据已同步消息修复；已排队纠正任务，原任务未发送"
+                AutomationStepLog.record(root: store.rootDirectory, uid: source.uid, step: "hosted-timestamp-conflict-repaired",
+                    detail: "source=\(source.id) replacement=\(id); exact synchronized content; no send receipt")
+                changed = true
+            } catch {
+                AutomationStepLog.record(root: store.rootDirectory, uid: source.uid, step: "hosted-timestamp-repair-deferred",
+                    detail: "source=\(source.id); original task retained")
+            }
+        }
+        return recoverLocalHistoryConflicts() || changed
+    }
+
+    private static func isLocalHistoryConflict(_ job: AutoReplyJob) -> Bool {
+        job.lastError?.hasPrefix("Message ID ") == true
+            && job.lastError?.hasSuffix(" changed after synchronization") == true
+    }
+
+    /// Local validation never submitted these jobs. Revalidate their exact
+    /// combined image/text input before retiring any duplicate work.
+    private func recoverLocalHistoryConflicts() -> Bool {
+        let groups = Dictionary(grouping: state.jobs.filter {
+            $0.state == .quarantined && Self.isLocalHistoryConflict($0) && !$0.sendWasInvoked
+                && $0.deliveryOutcome == .notSent && $0.supersededByJobID == nil
+                && $0.outgoingImages.isEmpty && $0.hostedGeneration == nil
+        }, by: \.uid)
+        let outbox = PinduoduoV2GenerationOutboxStore(rootDirectory: store.rootDirectory)
+        let identities = PDDConversationIdentityStore(root: store.rootDirectory)
+        let receipts = CustomerMessageReceipts(root: store.rootDirectory)
+        var changed = false
+        for (uid, sources) in groups {
+            do {
+                let captures = sources.flatMap { [$0.capture] + ($0.pendingSupplement.map { [$0] } ?? []) }
+                guard !sources.contains(where: \.supplementCapturePending),
+                      try sources.allSatisfy({ try outbox.load($0.id) == nil }),
+                      let capture = PDDVideoReplyBatch.joining(captures),
+                      let batch = capture.batch, !batch.customerMessageIDs.isEmpty else { continue }
+                let targets = batch.customerMessageIDs
+                let canonical = try identities.canonicalUID(uid)
+                var covered = manuallyDeletedMessageIDs(uid: uid)
+                var confirmedSent = Set<String>()
+                for owner in Set([uid, canonical]) {
+                    let ownerReceipts = try receipts.receipts(uid: owner)
+                    confirmedSent.formUnion(ownerReceipts.filter { $0.value.replySentAt != nil }.map(\.key))
+                    covered.formUnion(ownerReceipts.filter {
+                        $0.value.replySentAt != nil || $0.value.closedAt != nil
+                    }.map(\.key))
+                }
+                if targets.isSubset(of: confirmedSent),
+                   try sources.allSatisfy({ try PDDTextDeliveryAttemptStore(root: store.rootDirectory).load($0.id)?.mayHaveSent != true }),
+                   let sent = try state.jobs.first(where: { other in
+                       guard other.state == .completed, other.deliveryOutcome == .sent, other.sendWasInvoked,
+                             other.confirmedServiceMessageID != nil,
+                             sources.allSatisfy({ $0.sequence < other.sequence }),
+                             targets.isSubset(of: other.capture.batch?.customerMessageIDs ?? []) else { return false }
+                       return try identities.canonicalUID(other.uid) == canonical
+                   }) {
+                    let sourceIDs = Set(sources.map(\.id))
+                    for index in state.jobs.indices where sourceIDs.contains(state.jobs[index].id) {
+                        state.jobs[index].state = .failed
+                        state.jobs[index].supersededByJobID = sent.id
+                        state.jobs[index].nextAttemptAt = nil
+                        state.jobs[index].pendingSupplement = nil
+                        state.jobs[index].supplementCapturePending = false
+                        state.jobs[index].lastError = "该批次已由任务 #\(sent.sequence) 确认回复；原停放任务已归档，不会重复发送"
+                    }
+                    state.pendingCaptureRequests.removeAll { $0.sourceJobID.map { sourceIDs.contains($0) } == true }
+                    appendEvent(uid: uid, kind: "hosted-local-history-already-answered",
+                        detail: "source_jobs=\(sources.map { String($0.sequence) }.joined(separator: ",")); confirmed_job=\(sent.sequence); no new generation or send")
+                    changed = true
+                    continue
+                }
+                guard targets.isDisjoint(with: covered) else { continue }
+                let sourceIDs = Set(sources.map(\.id))
+                var blocked = false
+                for job in state.jobs where !sourceIDs.contains(job.id) {
+                    guard try identities.canonicalUID(job.uid) == canonical else { continue }
+                    let ids = (job.capture.batch?.customerMessageIDs ?? [])
+                        .union(job.pendingSupplement?.batch?.customerMessageIDs ?? [])
+                    guard !ids.isDisjoint(with: targets) else { continue }
+                    let checkpoint = try PDDTextDeliveryAttemptStore(root: store.rootDirectory).load(job.id)
+                    if [.queued, .generating, .ready, .sending, .uncertain, .quarantined].contains(job.state)
+                        || job.sendWasInvoked || job.deliveryOutcome == .sent || job.deliveryOutcome == .uncertain
+                        || checkpoint?.mayHaveSent == true { blocked = true; break }
+                }
+                guard !blocked else { continue }
+                var signatures: [String: Set<String>] = [:]
+                for item in captures {
+                    for image in item.imageAttachments {
+                        signatures[image.messageID, default: []].insert(image.sha256)
+                    }
+                }
+                for source in sources {
+                    guard try PDDTextDeliveryAttemptStore(root: store.rootDirectory).load(source.id)?.mayHaveSent != true else {
+                        blocked = true; break
+                    }
+                }
+                guard !blocked, signatures.values.allSatisfy({ $0.count == 1 }) else { continue }
+                let material = "local-history-recovery:" + sourceIDs.map(\.uuidString).sorted().joined(separator: ",")
+                let hex = SHA256.hash(data: Data(material.utf8)).map { String(format: "%02x", $0) }.joined()
+                let parts = [0..<8, 8..<12, 12..<16, 16..<20, 20..<32].map { range in
+                    String(hex[hex.index(hex.startIndex, offsetBy: range.lowerBound)..<hex.index(hex.startIndex, offsetBy: range.upperBound)])
+                }
+                let id = UUID(uuidString: parts.joined(separator: "-"))!
+                // Freeze validates synchronized bodies, media bytes and the
+                // complete target text locally; it performs no network calls.
+                _ = try PinduoduoV2RequestBuilder(rootDirectory: store.rootDirectory, now: now)
+                    .freeze(localJobID: id, capture: capture)
+                if !state.jobs.contains(where: { $0.id == id }) {
+                    state.nextSequence += 1
+                    state.jobs.append(.init(id: id, uid: uid, sequence: state.nextSequence, state: .queued,
+                        capture: capture, reply: nil, deliveryOutcome: .notSent, confirmedServiceMessageID: nil,
+                        retries: 0, nextAttemptAt: nil, lastError: nil, imageAttachments: capture.imageAttachments,
+                        videoAttachments: capture.videoAttachments))
+                }
+                for index in state.jobs.indices where sourceIDs.contains(state.jobs[index].id) {
+                    state.jobs[index].state = .failed
+                    state.jobs[index].supersededByJobID = id
+                    state.jobs[index].nextAttemptAt = nil
+                    state.jobs[index].pendingSupplement = nil
+                    state.jobs[index].supplementCapturePending = false
+                    state.jobs[index].lastError = "历史界面状态已核对；图片与相关文字已合并到新任务，原任务未发送"
+                }
+                state.pendingCaptureRequests.removeAll { $0.sourceJobID.map { sourceIDs.contains($0) } == true }
+                appendEvent(uid: uid, kind: "hosted-local-history-recovered",
+                    detail: "source_jobs=\(sources.map { String($0.sequence) }.joined(separator: ",")) replacement=\(id); input revalidated; no send receipt")
+                changed = true
+            } catch {
+                // Meaningful edits and unverifiable media stay parked. Never
+                // overwrite accepted history to force a request through.
+            }
+        }
+        return changed
     }
 
     private func reconcileConversationIdentities() throws {
@@ -827,6 +1198,7 @@ final class AutoReplyScheduler: ObservableObject {
             if identityRecoveryRetryAt[canonical].map({ $0 > now() }) == true { continue }
             do {
                 let covered = Set(try receipts.receipts(uid: canonical).filter { $0.value.replySentAt != nil }.map(\.key))
+                    .union(manuallyDeletedMessageIDs(uid: canonical))
                 let answeredAliases = active.filter { source in
                     let ids = (source.capture.batch?.customerMessageIDs ?? []).union(source.pendingSupplement?.batch?.customerMessageIDs ?? [])
                     return aliasUIDs.contains(source.uid) && source.state != .generating && !ids.isEmpty && ids.isSubset(of: covered)
@@ -861,6 +1233,24 @@ final class AutoReplyScheduler: ObservableObject {
                     identityRecoveryRetryAt[canonical] = now().addingTimeInterval(15)
                     appendEvent(uid: canonical, kind: "identity-recovery-waiting",
                         detail: "需完整会话依据或等待在途工作结束；15秒后复查；其他客户继续")
+                    continue
+                }
+                // A different job may have attempted these same messages.
+                // A fresh recovery UUID must not bypass its uncertain send or
+                // durable commit-intent checkpoint. Reconciliation resolves it.
+                var potentiallySent = Set<String>()
+                let attempts = PDDTextDeliveryAttemptStore(root: store.rootDirectory)
+                for job in state.jobs where uids.contains(job.uid) {
+                    let checkpoint = try attempts.load(job.id)
+                    if job.sendWasInvoked || job.state == .sending || job.deliveryOutcome == .uncertain || checkpoint?.mayHaveSent == true {
+                        potentiallySent.formUnion(job.capture.batch?.customerMessageIDs ?? [])
+                        potentiallySent.formUnion(job.pendingSupplement?.batch?.customerMessageIDs ?? [])
+                    }
+                }
+                guard (capture.batch?.customerMessageIDs ?? []).isDisjoint(with: potentiallySent) else {
+                    identityRecoveryRetryAt[canonical] = now().addingTimeInterval(15)
+                    appendEvent(uid: canonical, kind: "identity-recovery-delivery-unconfirmed",
+                        detail: "待恢复消息存在发送尝试或未确认回执；先核对原发送记录，不重新生成或发送")
                     continue
                 }
                 try receipts.capture(capture, at: now())
@@ -938,8 +1328,12 @@ final class AutoReplyScheduler: ObservableObject {
             }
             let closed = try await CustomerTransferPolicyStore.shared.closedMessageIDs(root: store.rootDirectory, uid: uid)
             let missing = pendingIDs.subtracting(known).subtracting(closed)
+                .subtracting(manuallyDeletedMessageIDs(uid: uid))
+                .subtracting(verifiedSubmissionPrefix(uid: uid))
             if !missing.isEmpty {
+                let requestCount = state.pendingCaptureRequests.count
                 enqueueCapture(uid, kind: .tail)
+                guard state.pendingCaptureRequests.count > requestCount else { continue }
                 appendEvent(uid: uid, kind: "capture-submission-gap-recovered",
                     detail: "message_ids=\(missing.sorted().joined(separator: ","))")
                 changed = true
@@ -949,6 +1343,23 @@ final class AutoReplyScheduler: ObservableObject {
             syncJobs()
             try persist()
         }
+    }
+
+    private func verifiedSubmissionPrefix(uid: String) -> Set<String> {
+        let cursor = answeredCursor(uid)
+        guard cursor.count > 0 else { return [] }
+        if let verified = verifiedSubmissionPrefixes[uid], verified.cursor == cursor {
+            return verified.messageIDs
+        }
+        // A tail scan cannot recover messages it will always skip. Validate the
+        // exact prefix so reordering or a stale count alone cannot hide new work.
+        let chatStore = PerUserChatStore(rootDirectory: store.rootDirectory)
+        guard let history = try? chatStore.loadAXFirst(uid: uid),
+              let timeline = try? AutoReplyTimeline.make(messages: history),
+              timeline.validatesPrefix(cursor) else { return [] }
+        let ids = Set(timeline.events.prefix(cursor.count).map(\.messageID))
+        verifiedSubmissionPrefixes[uid] = (cursor, ids)
+        return ids
     }
 
     private func nextDeliveryReconciliationIndex() -> Int? {
@@ -972,11 +1383,12 @@ final class AutoReplyScheduler: ObservableObject {
                     expectedCustomerMessageIDs: Set(batch.events.map(\.messageID)), lease: lease)
             }
             if case .sent(let id) = result {
+                let occurredAt = now()
                 state.jobs[index].deliveryOutcome = .sent
                 state.jobs[index].confirmedServiceMessageID = id
                 state.jobs[index].nextAttemptAt = nil
                 state.jobs[index].lastError = nil
-                try CustomerMessageReceipts(root: store.rootDirectory).replied(job.capture, at: now())
+                try CustomerMessageReceipts(root: store.rootDirectory).replied(job.capture, at: occurredAt)
                 state.confirmedAutoReplyMessageIDsByUID[job.uid, default: []].insert(id)
                 if let boundary = batch.incomingHandoffKey {
                     try await CustomerTransferPolicyStore.shared.acknowledgeIncomingReply(root: store.rootDirectory,
@@ -985,6 +1397,20 @@ final class AutoReplyScheduler: ObservableObject {
                 markProvisionalReceiptsAnswered(in: batch, uid: job.uid)
                 try transactionalStore.archiveTerminal(state.jobs[index])
                 appendEvent(uid: job.uid, kind: "reply-delivery-reconciled", detail: "job=\(job.id) message=\(id)")
+                if let receipt = job.hostedGeneration, let hostedDeliveryRecorder {
+                    do {
+                        try hostedDeliveryRecorder.enqueueVerifiedSend(
+                            receipt: receipt, actualSentText: reply,
+                            serviceMessageID: id, occurredAt: occurredAt
+                        )
+                        appendEvent(uid: job.uid, kind: "hosted-delivery-ack-enqueued",
+                            detail: "job=\(receipt.jobId)")
+                        Task { await hostedDeliveryRecorder.flushPending() }
+                    } catch {
+                        appendEvent(uid: job.uid, kind: "hosted-delivery-ack-pending",
+                            detail: "job=\(receipt.jobId)")
+                    }
+                }
             }
         } catch {
             appendEvent(uid: job.uid, kind: "reply-delivery-reconciliation-deferred", detail: error.localizedDescription)
@@ -1139,12 +1565,13 @@ final class AutoReplyScheduler: ObservableObject {
         guard deliveryEnabled, !realDeliveryPausedForPersistence else { return nil }
         return state.transferTasks.indices
             .filter { state.transferTasks[$0].state == .pending }
+            .filter { state.transferTasks[$0].hostedHandoffStartedAt == nil }
             .filter { state.transferTasks[$0].nextAttemptAt.map { $0 <= now() } ?? true }
             .filter { !PDDConversationIdentityStore.isSharedVisitorUID(state.transferTasks[$0].uid) }
             .filter { taskIndex in
-                state.jobs.first(where: {
-                    $0.id == state.transferTasks[taskIndex].sourceJobID
-                })?.state == .completed
+                let task = state.transferTasks[taskIndex]
+                let source = state.jobs.first { $0.id == task.sourceJobID }
+                return source?.state == (task.hostedFailureCode == nil ? .completed : .quarantined)
             }
             .min {
                 state.transferTasks[$0].createdAt < state.transferTasks[$1].createdAt
@@ -1154,13 +1581,33 @@ final class AutoReplyScheduler: ObservableObject {
     private func executeTransferTask(at index: Int) async throws {
         guard state.transferTasks.indices.contains(index) else { return }
         let task = state.transferTasks[index]
+        let hostedFailure = task.hostedFailureCode != nil
+        let hostedTargets = state.jobs.first { $0.id == task.sourceJobID }?.capture.batch?.customerMessageIDs ?? []
+        if hostedFailure {
+            // Persist intent before entering the transfer UI. If the process
+            // stops after a click, the restart leaves the result for review.
+            state.transferTasks[index].hostedHandoffStartedAt = now()
+            try persist(sendCritical: true)
+        }
         appendEvent(uid: task.uid, kind: "transfer-started", detail: "target=after-sales task=\(task.id)")
         let result: AutoReplyTransferResult
         do {
             result = try await performUI(stage: "transfer", uid: task.uid) { driver, lease in
-                try await driver.transferToAnyHuman(uid: task.uid, lease: lease)
+                if hostedFailure {
+                    return try await driver.transferHostedFailure(uid: task.uid,
+                        expectedCustomerMessageIDs: hostedTargets, lease: lease)
+                }
+                return try await driver.transferToAnyHuman(uid: task.uid, lease: lease)
             }
         } catch let error as PDDTransferPrecommitError {
+            if hostedFailure, task.nextAttemptAt != nil {
+                state.transferTasks[index].state = .failed
+                markHostedHandoffForReview(task)
+                appendEvent(uid: task.uid, kind: "transfer-failed", detail: "转接目标无法核对；需人工跟进：\(error.localizedDescription)")
+                try persist()
+                return
+            }
+            state.transferTasks[index].hostedHandoffStartedAt = nil
             state.transferTasks[index].nextAttemptAt = now().addingTimeInterval(15)
             appendEvent(uid: task.uid, kind: "transfer-precommit-retry-deferred",
                 detail: "No transfer control invoked; retry_in=15s; other customers continue; \(error.localizedDescription)")
@@ -1168,6 +1615,7 @@ final class AutoReplyScheduler: ObservableObject {
             return
         } catch {
             state.transferTasks[index].state = .failed
+            markHostedHandoffForReview(task)
             appendEvent(
                 uid: task.uid, kind: "transfer-failed",
                 detail: "转人工任务失败，已隔离且继续处理其他客户：\(error.localizedDescription)"
@@ -1177,11 +1625,25 @@ final class AutoReplyScheduler: ObservableObject {
         }
         switch result {
         case .transferred(let agentLabel):
-            state.transferTasks[index].state = .completed
             // Close all work already observed for this customer. Returning to this
             // profile cannot revive an old pending generation or handoff request.
             let closedIDs = Set(state.jobs.filter { $0.uid == task.uid }
                 .flatMap { $0.capture.fullHistory.filter { $0.sender == .customer }.map(\.id) })
+            if hostedFailure {
+                do {
+                    try await CustomerTransferPolicyStore.shared.completeHandoff(
+                        root: store.rootDirectory, uid: task.uid, messageIDs: closedIDs)
+                } catch {
+                    state.transferTasks[index].state = .failed
+                    markHostedHandoffForReview(task)
+                    appendEvent(uid: task.uid, kind: "transfer-verification-required",
+                        detail: "转接已确认，但无法保存接管状态；请人工核对：\(error.localizedDescription)")
+                    syncJobs()
+                    try persist()
+                    return
+                }
+            }
+            state.transferTasks[index].state = .completed
             for jobIndex in state.jobs.indices where state.jobs[jobIndex].uid == task.uid {
                 let jobID = state.jobs[jobIndex].id
                 generationAttempts[jobID] = nil
@@ -1191,6 +1653,14 @@ final class AutoReplyScheduler: ObservableObject {
                     state.jobs[jobIndex].state = .quarantined
                     state.jobs[jobIndex].lastError = "Closed after successful human handoff"
                 }
+                if hostedFailure, state.jobs[jobIndex].state == .quarantined,
+                   let ids = state.jobs[jobIndex].capture.batch?.customerMessageIDs, !ids.isEmpty,
+                   ids.isSubset(of: hostedTargets), !state.jobs[jobIndex].sendWasInvoked {
+                    state.jobs[jobIndex].state = .completed
+                    state.jobs[jobIndex].deliveryOutcome = .notSent
+                    let failure = state.jobs[jobIndex].lastError ?? ""
+                    state.jobs[jobIndex].lastError = "托管生成失败，已转人工 · \(failure.replacingOccurrences(of: "等待人工转接 · ", with: "", options: .anchored))"
+                }
                 state.jobs[jobIndex].pendingSupplement = nil
                 state.jobs[jobIndex].supplementCapturePending = false
             }
@@ -1199,8 +1669,10 @@ final class AutoReplyScheduler: ObservableObject {
             state.deferredVideoTransferEvents.removeAll { $0.uid == task.uid }
             syncJobs()
             try persist()
-            try await CustomerTransferPolicyStore.shared.completeHandoff(
-                root: store.rootDirectory, uid: task.uid, messageIDs: closedIDs)
+            if !hostedFailure {
+                try await CustomerTransferPolicyStore.shared.completeHandoff(
+                    root: store.rootDirectory, uid: task.uid, messageIDs: closedIDs)
+            }
             try CodexSessionRegistry(rootDirectory: store.rootDirectory).invalidate(uid: task.uid)
             appendEvent(
                 uid: task.uid, kind: "transfer-completed",
@@ -1208,11 +1680,13 @@ final class AutoReplyScheduler: ObservableObject {
             )
         case .failed(let reason):
             state.transferTasks[index].state = .failed
+            markHostedHandoffForReview(task)
             appendEvent(
                 uid: task.uid, kind: "transfer-failed",
                 detail: "转人工任务失败，已隔离且继续处理其他客户：\(reason)"
             )
         }
+        syncJobs()
         try persist()
     }
 
@@ -1241,7 +1715,8 @@ final class AutoReplyScheduler: ObservableObject {
         do {
             if driver.supportsTextDeliveryTracking, state.jobs[index].outgoingImages.isEmpty {
                 let attempts = PDDTextDeliveryAttemptStore(root: store.rootDirectory)
-                if try attempts.load(state.jobs[index].id)?.mayHaveSent != true {
+                let existing = try attempts.load(state.jobs[index].id)
+                if existing?.mayHaveSent != true, existing?.stage != .wordingRejected {
                     try attempts.save(.init(uid: uid, replySHA256: PDDTextDeliveryAttempt.hash(reply),
                         stage: .prepared, updatedAt: now()), id: state.jobs[index].id)
                 }
@@ -1327,6 +1802,21 @@ final class AutoReplyScheduler: ObservableObject {
             enqueueTransferTaskIfNeeded(at: index)
             _ = state.advanceSourceAndPromoteSupplement(at: index)
             try transactionalStore.archiveTerminal(state.jobs[index])
+            syncJobs()
+            try persist(sendCritical: true)
+            if let receipt = state.jobs[index].hostedGeneration,
+               let hostedDeliveryRecorder {
+                do {
+                    try hostedDeliveryRecorder.enqueueVerifiedSend(
+                        receipt: receipt, actualSentText: reply,
+                        serviceMessageID: serviceMessageID, occurredAt: now()
+                    )
+                    appendEvent(uid: uid, kind: "hosted-delivery-ack-enqueued", detail: "job=\(receipt.jobId)")
+                    Task { await hostedDeliveryRecorder.flushPending() }
+                } catch {
+                    appendEvent(uid: uid, kind: "hosted-delivery-ack-pending", detail: "job=\(receipt.jobId)")
+                }
+            }
         case .failedBeforeSend(let reason):
             if outgoingImages.isEmpty { removeUnnecessaryPreSendTail(uid: uid, cursor: batch.endCursor, deliveryID: deliveryID) }
             if state.jobs[index].replyAction == .replyThenTransfer {
@@ -1368,6 +1858,17 @@ final class AutoReplyScheduler: ObservableObject {
             // delivery receipt for customer messages.
             _ = state.advanceSourceAndPromoteSupplement(at: index, advanceCursor: false)
             try transactionalStore.archiveTerminal(state.jobs[index])
+        case .wordingRejected:
+            if outgoingImages.isEmpty { removeUnnecessaryPreSendTail(uid: uid, cursor: batch.endCursor, deliveryID: deliveryID) }
+            state.jobs[index].state = state.jobs[index].replyAction == .replyThenTransfer ? .completed : .failed
+            state.jobs[index].deliveryOutcome = .notSent
+            state.jobs[index].lastError = CustomerFacingReplyPolicy.wordingBlockedMessage
+            state.jobs[index].nextAttemptAt = nil
+            state.jobs[index].durableAttemptOperationID = nil
+            state.jobs[index].sendWasInvoked = false
+            _ = state.advanceSourceAndPromoteSupplement(at: index, advanceCursor: false)
+            try transactionalStore.archiveTerminal(state.jobs[index])
+            appendEvent(uid: uid, kind: "reply-wording-blocked", detail: "job=\(deliveryID); rejected draft requires review")
         case .uncertain(let reason):
             try finalizeUncertainSend(at: index, batch: batch, reason: reason)
         }
@@ -1394,7 +1895,8 @@ final class AutoReplyScheduler: ObservableObject {
         guard !messageIDs.isEmpty else { return }
         let known = Set(state.videoHoldingNotices.filter { $0.uid == uid }.flatMap { $0.messageIDs })
         let sent = (try? CustomerMessageReceipts(root: store.rootDirectory).receipts(uid: uid)) ?? [:]
-        let fresh = messageIDs.subtracting(known).filter { sent[$0]?.replySentAt == nil && sent[$0]?.closedAt == nil }
+        let fresh = messageIDs.subtracting(known).subtracting(manuallyDeletedMessageIDs(uid: uid))
+            .filter { sent[$0]?.replySentAt == nil && sent[$0]?.closedAt == nil }
         guard !fresh.isEmpty else { return }
         refreshVideoHoldingNotices()
         if let index = state.videoHoldingNotices.firstIndex(where: { $0.uid == uid && $0.finishedAt == nil }) {
@@ -1403,6 +1905,28 @@ final class AutoReplyScheduler: ObservableObject {
             state.videoHoldingNotices.append(.init(uid: uid, messageIDs: Set(fresh), capturedAt: now()))
         }
         appendEvent(uid: uid, kind: "video-hold-timer-started", detail: "delay_seconds=10 message_ids=\(fresh.sorted().joined(separator: ","))")
+    }
+
+    private func recentVideoMessageIDs(
+        in capture: AutoReplyCapture,
+        candidates: Set<String>
+    ) -> Set<String> {
+        let oldestEligible = now().addingTimeInterval(-120)
+        let messages = Dictionary(uniqueKeysWithValues: capture.fullHistory.map { ($0.id, $0) })
+        return candidates.filter { id in
+            guard let message = messages[id], message.sender == .customer,
+                  message.kind == .video else { return false }
+            return message.capturedAt >= oldestEligible
+        }
+    }
+
+    private func recentVideoMessageIDs(uid: String, candidates: Set<String>) -> Set<String> {
+        var captures = state.pendingVideoBatches.filter { $0.uid == uid }.map(\.capture)
+        captures.append(contentsOf: state.jobs.filter { $0.uid == uid }.map(\.capture))
+        if let latestCapture, latestCapture.uid == uid { captures.append(latestCapture) }
+        return captures.reduce(into: Set<String>()) { result, capture in
+            result.formUnion(recentVideoMessageIDs(in: capture, candidates: candidates))
+        }
     }
 
     private func refreshVideoHoldingNotices() {
@@ -1443,7 +1967,7 @@ final class AutoReplyScheduler: ObservableObject {
                 state.videoHoldingNotices[index].outcome = "sent"
                 state.videoHoldingNotices[index].confirmedServiceMessageID = id
                 state.confirmedAutoReplyMessageIDsByUID[notice.uid, default: []].insert(id)
-            case .failedBeforeSend, .discardedBeforeSend: state.videoHoldingNotices[index].outcome = "not-sent"
+            case .failedBeforeSend, .discardedBeforeSend, .wordingRejected: state.videoHoldingNotices[index].outcome = "not-sent"
             case .uncertain: state.videoHoldingNotices[index].outcome = "uncertain"
             }
             appendEvent(uid: notice.uid, kind: "video-hold-send-result", detail: "notice=\(notice.id) \(result); final reply still required")
@@ -1541,7 +2065,10 @@ final class AutoReplyScheduler: ObservableObject {
             generationTasks[id] = Task { [weak self, generator] in
                 do {
                     let result = try await withOperationDeadline(deadline, stage: "generation") {
-                        try await generator.generate(capture)
+                        if let durable = generator as? any DurableJobAutoReplyGenerating {
+                            return try await durable.generate(jobID: id, capture: capture)
+                        }
+                        return try await generator.generate(capture)
                     }
                     self?.generationFinished(jobID: id, attemptID: attempt, result: .success(result))
                 } catch {
@@ -1624,10 +2151,15 @@ final class AutoReplyScheduler: ObservableObject {
               state.jobs[index].state == .generating else { return }
         switch result {
         case .success(let generated):
-            state.jobs[index].reply = generated.reply
+            state.jobs[index].reply = CustomerFacingReplyPolicy.preparedForPinduoduo(generated.reply)
+            if state.jobs[index].lastError == PinduoduoV2ClientError.recoveryPending.errorDescription {
+                state.jobs[index].lastError = nil
+                state.jobs[index].nextAttemptAt = nil
+            }
             state.jobs[index].outgoingImages = generated.outgoingImages
             state.jobs[index].replyAction = generated.action
             state.jobs[index].transferReason = generated.transferReason
+            state.jobs[index].hostedGeneration = generated.hostedGeneration
             state.jobs[index].generationDiagnostic = generated.diagnostic
             if state.jobs[index].capture.batch?.incomingHandoffKey != nil {
                 state.jobs[index].replyAction = .reply
@@ -1638,11 +2170,46 @@ final class AutoReplyScheduler: ObservableObject {
                 detail: "job=\(jobID) action=\(state.jobs[index].replyAction.rawValue)")
             enqueueTransferTaskIfNeeded(at: index)
             concurrencyPolicy.recordSuccess(now: now())
+        case .failure(let error as PinduoduoV2ClientError) where error == .recoveryPending:
+            let message = PinduoduoV2ClientError.recoveryPending.errorDescription
+            if state.jobs[index].lastError != message {
+                appendEvent(uid: state.jobs[index].uid, kind: "hosted-recovery-wait", detail: "job=\(jobID); recheck original job in 30 seconds")
+            }
+            state.jobs[index].state = .queued
+            state.jobs[index].lastError = message
+            state.jobs[index].nextAttemptAt = now().addingTimeInterval(30)
         case .failure(let error):
             state.jobs[index].retries += 1
             state.jobs[index].lastError = retryPolicy.boundedDescription(error)
             appendEvent(uid: state.jobs[index].uid, kind: "generation-failed",
                 detail: "job=\(jobID) \(retryPolicy.boundedDescription(error))")
+            if let hostedError = error as? PinduoduoV2ClientError {
+                if hostedError.retryable {
+                    switch retryPolicy.decision(attempt: state.jobs[index].retries, error: error, now: now()) {
+                    case .retry(let date), .rebuildSessionAndRetry(let date):
+                        state.jobs[index].state = .queued
+                        state.jobs[index].nextAttemptAt = date
+                    case .failRevision:
+                        state.jobs[index].state = .quarantined
+                        state.jobs[index].deliveryOutcome = .notSent
+                        state.jobs[index].nextAttemptAt = nil
+                    }
+                } else {
+                    state.jobs[index].state = .quarantined
+                    state.jobs[index].deliveryOutcome = .notSent
+                    state.jobs[index].nextAttemptAt = nil
+                    if case .jobFailed(let code, _) = hostedError {
+                        _ = enqueueHostedFailureTransfer(at: index, code: code)
+                    }
+                }
+                break
+            }
+            if error is PinduoduoV2CredentialError {
+                state.jobs[index].state = .quarantined
+                state.jobs[index].deliveryOutcome = .notSent
+                state.jobs[index].nextAttemptAt = nil
+                break
+            }
             if state.jobs[index].capture.batch?.incomingHandoffKey != nil, !(error is CancellationError) {
                 state.jobs[index].reply = PDDAXIncomingTransfer.fallbackReply(history: state.jobs[index].capture.fullHistory)
                 state.jobs[index].replyAction = .reply
@@ -1687,6 +2254,7 @@ final class AutoReplyScheduler: ObservableObject {
                 }
             }
         }
+        recoverHostedTimestampConflicts()
         syncJobs()
         do {
             // A generated reply is never eligible for delivery until the exact
@@ -1837,11 +2405,35 @@ final class AutoReplyScheduler: ObservableObject {
         catch {
             appendEvent(uid: uid, kind: "discovery-capture-ack-deferred", detail: error.localizedDescription)
         }
-        registerVideoHold(uid: uid, messageIDs: Set(rawCapture.batch?.events.filter { $0.kind == .video }.map(\.messageID) ?? []))
+        let capturedVideoIDs = Set(
+            rawCapture.batch?.events.filter { $0.kind == .video }.map(\.messageID) ?? []
+        )
+        let recentVideoIDs = recentVideoMessageIDs(in: rawCapture, candidates: capturedVideoIDs)
+        let staleVideoIDs = capturedVideoIDs.subtracting(recentVideoIDs)
+        if !staleVideoIDs.isEmpty {
+            appendEvent(
+                uid: uid,
+                kind: "video-hold-stale-skipped",
+                detail: "message_ids=\(staleVideoIDs.sorted().joined(separator: ",")); no courtesy timer for history older than 120s"
+            )
+        }
+        registerVideoHold(uid: uid, messageIDs: recentVideoIDs)
         appendEvent(uid: uid, kind: "customer-messages-captured",
             detail: "message_ids=\((rawCapture.batch?.customerMessageIDs ?? []).sorted().joined(separator: ","))")
         try reconcileVisibleReplies(in: rawCapture, uid: uid)
-        let normalizedCapture = normalizeObservation(rawCapture, uid: uid)
+        let observedCapture = normalizeObservation(rawCapture, uid: uid)
+        guard let normalizedCapture = captureByRemovingMessages(observedCapture,
+            messageIDs: manuallyDeletedMessageIDs(uid: uid)) else {
+            if request.kind == .supplement, let index = supplementSourceIndex(for: request) {
+                state.jobs[index].supplementCapturePending = false
+                if Self.isLocalHistoryConflict(state.jobs[index]) {
+                    _ = recoverLocalHistoryConflicts()
+                }
+            }
+            latestCapture = observedCapture
+            syncJobs(); try persist()
+            return
+        }
         let capture: AutoReplyCapture
         if request.kind == .ordinary || request.kind == .tail {
             let closed = try await CustomerTransferPolicyStore.shared.closedMessageIDs(
@@ -1849,6 +2441,7 @@ final class AutoReplyScheduler: ObservableObject {
             let aliasCovered = confirmedAliasMessageIDs(in: normalizedCapture)
             let receiptClosed = try CustomerMessageReceipts(root: store.rootDirectory).closedMessageIDs(uid: uid)
             let covered = coveredMessageIDs(uid: uid).union(closed).union(aliasCovered).union(receiptClosed)
+                .union(manuallyDeletedMessageIDs(uid: uid))
             if !aliasCovered.isEmpty {
                 appendEvent(uid: uid, kind: "masked-name-delivery-reconciled",
                     detail: "Previously sent reply verified after its exact target message in this chat; covered_message_ids=\(aliasCovered.sorted().joined(separator: ","))")
@@ -1872,6 +2465,25 @@ final class AutoReplyScheduler: ObservableObject {
             capture = filtered
         } else {
             capture = normalizedCapture
+        }
+        if let batch = capture.batch, batch.incomingHandoffKey == nil,
+           let parked = state.jobs.first(where: {
+               $0.uid == uid && $0.state == .quarantined
+                   && $0.capture.batch?.events == batch.events
+                   && imageInputIdentity($0.capture) == imageInputIdentity(capture)
+                   && $0.capture.videoAttachments == capture.videoAttachments
+                   && $0.capture.pendingVideoMessageIDs == capture.pendingVideoMessageIDs
+           }) {
+            if request.kind == .supplement, let index = supplementSourceIndex(for: request) {
+                state.jobs[index].supplementCapturePending = false
+                if Self.isLocalHistoryConflict(state.jobs[index]) {
+                    _ = recoverLocalHistoryConflicts()
+                }
+            }
+            latestCapture = capture
+            appendEvent(uid: uid, kind: "parked-batch-already-recorded", detail: "job=\(parked.id); identical text/media retained; no duplicate generation")
+            syncJobs(); try persist()
+            return
         }
         latestCapture = capture
         if request.kind != .videoRecovery, let batch = capture.batch, batch.incomingHandoffKey == nil,
@@ -1916,7 +2528,9 @@ final class AutoReplyScheduler: ObservableObject {
                 }
                 state.jobs[index].supplementCapturePending = false
                 if [.completed, .failed, .uncertain, .quarantined].contains(state.jobs[index].state) {
-                    _ = state.advanceSourceAndPromoteSupplement(at: index)
+                    if state.jobs[index].state != .quarantined || !Self.isLocalHistoryConflict(state.jobs[index]) {
+                        _ = state.advanceSourceAndPromoteSupplement(at: index)
+                    }
                 }
             } else if state.jobs[index].pendingSupplement != nil {
                 state.jobs[index].supplementCapturePending = false
@@ -1936,6 +2550,11 @@ final class AutoReplyScheduler: ObservableObject {
                 }
             } else {
                 state.jobs[index].supplementCapturePending = false
+            }
+            if state.jobs[index].state == .quarantined,
+               Self.isLocalHistoryConflict(state.jobs[index]),
+               !state.jobs[index].supplementCapturePending {
+                _ = recoverLocalHistoryConflicts()
             }
             syncJobs()
             try persist()
@@ -2050,6 +2669,12 @@ final class AutoReplyScheduler: ObservableObject {
         ))
     }
 
+    private func imageInputIdentity(_ capture: AutoReplyCapture) -> [String] {
+        capture.imageAttachments.map {
+            [$0.messageID, $0.sha256, $0.mimeType.lowercased(), String($0.byteCount)].joined(separator: "\u{1f}")
+        }.sorted()
+    }
+
     private func normalizeObservation(_ rawCapture: AutoReplyCapture, uid: String) -> AutoReplyCapture {
         let observedServiceIDs = Set(
             rawCapture.fullHistory.lazy.filter { $0.sender == .service }.map(\.id)
@@ -2105,6 +2730,19 @@ final class AutoReplyScheduler: ObservableObject {
             usedServiceIDs.insert(service.id)
             appendEvent(uid: uid, kind: "delivery-reconciled", detail: service.id)
             try transactionalStore.archiveTerminal(state.jobs[jobIndex])
+            if let receipt = state.jobs[jobIndex].hostedGeneration,
+               let hostedDeliveryRecorder {
+                do {
+                    try hostedDeliveryRecorder.enqueueVerifiedSend(
+                        receipt: receipt, actualSentText: reply,
+                        serviceMessageID: service.id, occurredAt: service.capturedAt
+                    )
+                    appendEvent(uid: uid, kind: "hosted-delivery-ack-enqueued", detail: "job=\(receipt.jobId)")
+                    Task { await hostedDeliveryRecorder.flushPending() }
+                } catch {
+                    appendEvent(uid: uid, kind: "hosted-delivery-ack-pending", detail: "job=\(receipt.jobId)")
+                }
+            }
         }
     }
 
@@ -2133,6 +2771,7 @@ final class AutoReplyScheduler: ObservableObject {
     }
 
     private func admitRecoveredVideo(uid: String, attachment: AutoReplyVideoAttachment) {
+        guard !manuallyDeletedMessageIDs(uid: uid).contains(attachment.messageID) else { return }
         guard !state.jobs.contains(where: {
             $0.uid == uid && $0.videoAttachments.contains { existing in
                 existing.messageID == attachment.messageID
@@ -2215,15 +2854,28 @@ final class AutoReplyScheduler: ObservableObject {
         reason: String
     ) throws {
         let uid = state.jobs[index].uid
+        let attempt = state.jobs[index].outgoingImages.isEmpty
+            ? try? PDDTextDeliveryAttemptStore(root: store.rootDirectory).load(state.jobs[index].id)
+            : nil
         state.jobs[index].state = .completed
         state.jobs[index].deliveryOutcome = .uncertain
         state.jobs[index].lastError = reason
-        let tracked = state.jobs[index].outgoingImages.isEmpty
-            && (try? PDDTextDeliveryAttemptStore(root: store.rootDirectory).load(state.jobs[index].id)) != nil
+        let tracked = attempt != nil
         state.jobs[index].nextAttemptAt = tracked ? now().addingTimeInterval(15) : nil
         _ = state.advanceSourceAndPromoteSupplement(at: index)
         if !tracked { try transactionalStore.archiveTerminal(state.jobs[index]) }
         appendEvent(uid: uid, kind: "reply-delivery-reconciliation-pending", detail: "job=\(state.jobs[index].id); no confirmed delivery receipt")
+        if attempt?.mayHaveSent == true,
+           let receipt = state.jobs[index].hostedGeneration,
+           let hostedDeliveryRecorder {
+            do {
+                try hostedDeliveryRecorder.enqueueUnknown(receipt: receipt, occurredAt: now())
+                appendEvent(uid: uid, kind: "hosted-delivery-unknown-enqueued", detail: "job=\(receipt.jobId)")
+                Task { await hostedDeliveryRecorder.flushPending() }
+            } catch {
+                appendEvent(uid: uid, kind: "hosted-delivery-unknown-pending", detail: "job=\(receipt.jobId)")
+            }
+        }
     }
 
     private func performUI<Value: Sendable>(
@@ -2363,7 +3015,7 @@ final class AutoReplyScheduler: ObservableObject {
             state: isPureFailedVideo ? .ready : .queued,
             capture: capture,
             reply: isPureFailedVideo
-                ? "视频已收到，您希望我重点帮您查看哪个问题？也可以描述一下具体表现。"
+                ? CustomerFacingFallback.productProblemQuestion(history: capture.fullHistory)
                 : nil,
             deliveryOutcome: nil,
             confirmedServiceMessageID: nil,
@@ -2399,6 +3051,7 @@ final class AutoReplyScheduler: ObservableObject {
                 if [.queued, .generating, .ready, .sending].contains(job.state) {
                     return true
                 }
+                if job.lastError == CustomerFacingReplyPolicy.wordingBlockedMessage { return true }
                 return job.state == .completed && job.deliveryOutcome != .notSent
             }
             .flatMap { $0.capture.batch?.events.map(\.messageID) ?? [] }
@@ -2656,11 +3309,20 @@ final class AutoReplyScheduler: ObservableObject {
 
     private func isHeadOfGeneration(_ index: Int) -> Bool {
         let job = state.jobs[index]
+        guard !state.transferTasks.contains(where: {
+            $0.uid == job.uid && $0.hostedFailureCode != nil && $0.state == .pending
+        }) else { return false }
         guard !liveGenerationJobIDs.contains(where: { id in state.jobs.contains { $0.id == id && $0.uid == job.uid } }) else { return false }
+        let serializesActiveDelivery = (generator as? any AutoReplyGenerationPolicyProviding)?
+            .serializesGenerationBehindActiveDelivery == true
         return !state.jobs.indices.contains { other in
             guard other != index, state.jobs[other].uid == job.uid else { return false }
             let prior = state.jobs[other]
             if prior.state == .generating { return true }
+            if serializesActiveDelivery, prior.sequence < job.sequence,
+               [.ready, .sending].contains(prior.state) {
+                return true
+            }
             return prior.sequence < job.sequence && [.discovered, .capturing, .queued].contains(prior.state)
         }
     }
@@ -2741,6 +3403,65 @@ final class AutoReplyScheduler: ObservableObject {
             }
         }
         state.provisionalReceiptsByUID[uid] = receipts
+    }
+
+    private func restoreHostedFailureTransfers() -> Bool {
+        var changed = false
+        for index in state.transferTasks.indices where state.transferTasks[index].state == .pending
+            && state.transferTasks[index].hostedHandoffStartedAt != nil {
+            state.transferTasks[index].state = .failed
+            markHostedHandoffForReview(state.transferTasks[index])
+            appendEvent(uid: state.transferTasks[index].uid, kind: "transfer-verification-required",
+                detail: "上次托管失败转接的结果尚未确认；请人工核对")
+            changed = true
+        }
+        let latest = Dictionary(grouping: state.jobs.indices, by: { state.jobs[$0].uid }).values.compactMap { indices in
+            indices.max { state.jobs[$0].sequence < state.jobs[$1].sequence }
+        }
+        let outbox = PinduoduoV2GenerationOutboxStore(rootDirectory: store.rootDirectory)
+        for index in latest.sorted(by: { state.jobs[$0].sequence < state.jobs[$1].sequence }) {
+            let job = state.jobs[index]
+            guard job.state == .quarantined, let record = try? outbox.load(job.id),
+                  record.localJobID == job.id, record.customerUid == job.uid,
+                  record.hostedJobID != nil, record.phase == .failed, let code = record.lastErrorCode
+            else { continue }
+            if enqueueHostedFailureTransfer(at: index, code: code) { changed = true }
+        }
+        return changed
+    }
+
+    private func enqueueHostedFailureTransfer(at index: Int, code: String) -> Bool {
+        let job = state.jobs[index]
+        guard ["CODEX_FAILED", "EPERM"].contains(code), !job.sendWasInvoked,
+              job.deliveryOutcome == .notSent, let batch = job.capture.batch,
+              batch.incomingHandoffKey == nil, !batch.customerMessageIDs.isEmpty,
+              !PDDConversationIdentityStore.isSharedVisitorUID(job.uid),
+              let receipts = try? CustomerMessageReceipts(root: store.rootDirectory).receipts(uid: job.uid),
+              batch.customerMessageIDs.contains(where: { receipts[$0]?.replySentAt == nil && receipts[$0]?.closedAt == nil }),
+              !state.transferTasks.contains(where: { task in
+                  if task.sourceJobID == job.id { return true }
+                  guard task.uid == job.uid else { return false }
+                  if task.state == .pending { return true }
+                  guard task.hostedFailureCode != nil, task.state == .failed,
+                        let previous = state.jobs.first(where: { $0.id == task.sourceJobID })?.capture.batch
+                  else { return false }
+                  return !previous.customerMessageIDs.isDisjoint(with: batch.customerMessageIDs)
+              }) else { return false }
+        state.transferTasks.append(.init(id: UUID(), sourceJobID: job.id, uid: job.uid,
+            revision: job.revision, reason: .troubleshootingExhausted, state: .pending, createdAt: now(),
+            hostedFailureCode: code))
+        state.jobs[index].lastError = "等待人工转接 · \(job.lastError ?? code)"
+        appendEvent(uid: job.uid, kind: "hosted-failure-transfer-queued",
+            detail: "job=\(job.id) code=\(code); 已排队转售后客服")
+        return true
+    }
+
+    private func markHostedHandoffForReview(_ task: AutoReplyTransferTask) {
+        guard let code = task.hostedFailureCode,
+              let index = state.jobs.firstIndex(where: { $0.id == task.sourceJobID }) else { return }
+        let failure = state.jobs[index].lastError ?? code
+        state.jobs[index].lastError = "转接需人工核对 · \(failure.replacingOccurrences(of: "等待人工转接 · ", with: "", options: .anchored))"
+        syncJobs()
     }
 
     private func enqueueTransferTaskIfNeeded(at index: Int) {

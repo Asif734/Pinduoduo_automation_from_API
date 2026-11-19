@@ -3,6 +3,14 @@ import XCTest
 @testable import PDDAXReader
 
 final class PDDRuntimeIdentityTests: XCTestCase {
+    func testProductionRequiresManualStartAfterEveryLaunch() {
+        let identity = PDDRuntimeIdentity.currentAutoReply(
+            homeDirectory: URL(fileURLWithPath: "/tmp/pdd-production-home", isDirectory: true)
+        )
+
+        XCTAssertFalse(identity.startsAutomatically)
+    }
+
     func testCandidateUsesIndependentIdentityAndDataRootAndStartsStopped() {
         let home = URL(fileURLWithPath: "/tmp/pdd-candidate-home", isDirectory: true)
 

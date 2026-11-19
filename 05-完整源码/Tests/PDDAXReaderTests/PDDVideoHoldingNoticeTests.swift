@@ -3,6 +3,59 @@ import XCTest
 
 @MainActor
 final class PDDVideoHoldingNoticeTests: XCTestCase {
+    func testFailedVideoAsksProductProblemOnceThenWaitsForCustomerAcrossRestart() async throws {
+        let f = try Fixture(pending: true); defer { f.clean() }
+        await f.capture()
+        for phase in [PDDVideoTransferPhase.failed, .fallbackRequired, .failed] {
+            await f.scheduler.receiveVideoTransferEvent(.init(uid: "customer", messageID: "video", phase: phase))
+        }
+        await f.ticks(8)
+        XCTAssertEqual(f.driver.sent, ["请问您的产品遇到了什么问题？麻烦您描述一下具体表现，我来帮您排查。"])
+        XCTAssertEqual(f.scheduler.jobs.first?.state, .completed)
+        XCTAssertTrue(f.scheduler.pendingVideoBatchesSnapshot.isEmpty)
+        XCTAssertNotNil(try CustomerMessageReceipts(root: f.root).receipts(uid: "customer")["video"]?.replySentAt)
+        f.scheduler.stop()
+        let restored = try AutoReplyScheduler(driver: f.driver, generator: f.generator,
+            store: AutoReplyStore(rootDirectory: f.root), now: { f.clock.value })
+        XCTAssertTrue(restored.pendingVideoBatchesSnapshot.isEmpty)
+        restored.start(); defer { restored.stop() }
+        f.clock.value += 1800
+        for _ in 0..<8 { await restored.tick() }
+        XCTAssertEqual(f.driver.sent.count, 1, "No repeated product question or video retry after restart")
+        XCTAssertTrue(restored.pendingVideoBatchesSnapshot.isEmpty)
+        f.driver.captures["customer"] = try holdCapture(messages: [
+            holdMessage("video", .video, "[视频]"),
+            holdMessage("problem", .text, "The printer does not print")
+        ], targetIDs: ["problem"])
+        f.driver.discoveries = [.init(uid: "customer", hasUnreadEvidence: true)]
+        restored.requestAXRefresh()
+        for _ in 0..<20 { await restored.tick(); try await Task.sleep(for: .milliseconds(2)) }
+        XCTAssertEqual(f.driver.sent.count, 2)
+        XCTAssertEqual(f.driver.sent.last, "实际答复")
+        let captures = await f.generator.captures
+        XCTAssertEqual(captures.map { $0.batch?.customerMessageIDs }, [["problem"]])
+    }
+
+    func testHistoricalVideoInRecoveredBatchDoesNotStartCourtesyTimer() async throws {
+        let f = try Fixture(pending: true); defer { f.clean() }
+        let stale = PDDChatMessage(
+            id: "old-video", sender: .customer, content: "[视频]", displayTime: nil,
+            kind: .video, capturedAt: f.clock.value.addingTimeInterval(-3 * 60 * 60)
+        )
+        f.driver.captures["customer"] = try holdCapture(
+            messages: [stale], pending: true
+        )
+
+        await f.capture()
+        f.clock.value += 20
+        await f.ticks(5)
+
+        XCTAssertTrue(f.driver.sent.isEmpty)
+        XCTAssertTrue(
+            try AutoReplyStore(rootDirectory: f.root).load().videoHoldingNotices.isEmpty
+        )
+    }
+
     func testNoticeWithoutCapturedTargetCannotBlockAnotherCustomersDueNotice() async throws {
         let f = try Fixture(pending: true); defer { f.clean() }
         await f.scheduler.receiveVideoTransferEvent(.init(uid: "missing-customer", messageID: "missing-video", phase: .waitingForAddress))

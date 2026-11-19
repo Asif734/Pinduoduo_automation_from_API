@@ -68,7 +68,7 @@ final class AutoReplyProgressPresentationTests: XCTestCase {
         )
     }
 
-    func testGeneratingJobShowsCustomerAndCLICount() {
+    func testGeneratingJobShowsCustomerAndAPICount() {
         let headline = AutoReplyProgressPresentation.headline(
             isRunning: true,
             currentUIOwner: nil,
@@ -76,7 +76,7 @@ final class AutoReplyProgressPresentationTests: XCTestCase {
             liveGenerationCount: 1
         )
 
-        XCTAssertEqual(headline, BilingualText.lines("GZC-000001 · Codex 正在生成回复 · CLI 1", "GZC-000001 · Codex is generating a reply · CLI 1"))
+        XCTAssertEqual(headline, BilingualText.lines("GZC-000001 · 托管 API 正在生成回复 · API 1", "GZC-000001 · The hosted API is generating a reply · API 1"))
     }
 
     func testIdleRunningStateExplainsPixelRedDotWait() {
@@ -195,6 +195,16 @@ final class AutoReplyProgressPresentationTests: XCTestCase {
             AutoReplyProgressPresentation.jobStageName(uncertain),
             BilingualText.lines("发送结果待核对", "Send result requires verification")
         )
+    }
+
+    func testQueuedFollowupNamesHostedRecoveryBlocker() {
+        var earlier = job(state: .queued)
+        earlier.sequence = 334
+        earlier.lastError = PinduoduoV2ClientError.recoveryPending.errorDescription
+        var followup = job(state: .queued)
+        followup.sequence = 346
+        XCTAssertTrue(AutoReplyProgressPresentation.jobStageName(earlier).contains("Pinduoduo hosted recovery required"))
+        XCTAssertTrue(AutoReplyProgressPresentation.jobStageName(followup, jobs: [earlier]).contains("Waiting for #334"))
     }
 
     private func job(state: AutoReplyJobState) -> AutoReplyJob {

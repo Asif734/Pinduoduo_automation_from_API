@@ -222,6 +222,7 @@ struct AutoReplyJob: Codable, Equatable, Sendable, Identifiable {
     var imageCaptureAttempted: Bool
     var replyAction: CodexReplyAction
     var transferReason: CodexTransferReason
+    var hostedGeneration: PinduoduoV2GenerationReceipt?
 
     init(
         id: UUID,
@@ -248,6 +249,7 @@ struct AutoReplyJob: Codable, Equatable, Sendable, Identifiable {
         imageCaptureAttempted: Bool = false,
         replyAction: CodexReplyAction = .reply,
         transferReason: CodexTransferReason = .none,
+        hostedGeneration: PinduoduoV2GenerationReceipt? = nil,
         customerMissingSince: Date? = nil,
         omittedAt: Date? = nil
     ) {
@@ -277,6 +279,7 @@ struct AutoReplyJob: Codable, Equatable, Sendable, Identifiable {
         self.imageCaptureAttempted = imageCaptureAttempted
         self.replyAction = replyAction
         self.transferReason = transferReason
+        self.hostedGeneration = hostedGeneration
         self.customerMissingSince = customerMissingSince
         self.omittedAt = omittedAt
     }
@@ -288,6 +291,7 @@ struct AutoReplyJob: Codable, Equatable, Sendable, Identifiable {
         case sendWasInvoked, revision, pendingSupplement, supplementCapturePending, deliveryNotBefore, supersededByJobID
         case imageCaptureAttempted
         case replyAction, transferReason
+        case hostedGeneration
         case customerMissingSince, omittedAt
     }
 
@@ -345,6 +349,9 @@ struct AutoReplyJob: Codable, Equatable, Sendable, Identifiable {
         transferReason = try container.decodeIfPresent(
             CodexTransferReason.self, forKey: .transferReason
         ) ?? .none
+        hostedGeneration = try container.decodeIfPresent(
+            PinduoduoV2GenerationReceipt.self, forKey: .hostedGeneration
+        )
     }
 }
 
@@ -364,6 +371,8 @@ struct AutoReplyTransferTask: Codable, Equatable, Sendable, Identifiable {
     var state: AutoReplyTransferTaskState
     let createdAt: Date
     var nextAttemptAt: Date? = nil
+    var hostedFailureCode: String? = nil
+    var hostedHandoffStartedAt: Date? = nil
 }
 
 struct AutoReplyEvent: Codable, Equatable, Sendable, Identifiable {
@@ -424,6 +433,7 @@ struct AutoReplyPersistentState: Codable, Equatable, Sendable {
     var schemaVersion = 6
     var nextSequence = 0
     var jobs: [AutoReplyJob] = []
+    var manuallyDeletedMessageIDsByUID: [String: Set<String>] = [:]
     var answeredCursors: [String: AutoReplyCursor] = [:]
     var baselinedUIDs: Set<String> = []
     var knownServiceMessageIDsByUID: [String: Set<String>] = [:]
@@ -442,6 +452,7 @@ struct AutoReplyPersistentState: Codable, Equatable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case schemaVersion, nextSequence, jobs, answeredCursors, baselinedUIDs
+        case manuallyDeletedMessageIDsByUID
         case knownServiceMessageIDsByUID, confirmedAutoReplyMessageIDsByUID, events
         case consecutiveDeliveryCount, pendingCaptureRequests
         case conversationLocatorsByUID
@@ -459,6 +470,9 @@ struct AutoReplyPersistentState: Codable, Equatable, Sendable {
         schemaVersion = try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
         nextSequence = try container.decodeIfPresent(Int.self, forKey: .nextSequence) ?? 0
         jobs = try container.decodeIfPresent([AutoReplyJob].self, forKey: .jobs) ?? []
+        manuallyDeletedMessageIDsByUID = try container.decodeIfPresent(
+            [String: Set<String>].self, forKey: .manuallyDeletedMessageIDsByUID
+        ) ?? [:]
         answeredCursors = try container.decodeIfPresent(
             [String: AutoReplyCursor].self, forKey: .answeredCursors
         ) ?? [:]

@@ -214,16 +214,16 @@ final class PDDAXConversationDriver: PDDConversationOpening {
                     old?.active = true // Clearing the dot is not a second transfer.
                 }
             }
-            // A continuously lit dot can hide two identical previews within the
-            // same minute. A slow verification probe protects against that ambiguity.
-            let unreadRecheckDue = !transferOnly && old?.handledAt.map { now().timeIntervalSince($0) >= 30 } == true
-            let unchangedHandled = old?.active == true && old?.signature == signature && old?.handled == true && !unreadRecheckDue
+            // A handled signal needs a fresh unread edge or changed preview to
+            // select a background conversation again. Elapsed time is not evidence.
+            let isolatedSignal = tasks.contains {
+                $0.identityConflictAt != nil && $0.signalKey == key && $0.signalSignature == signature
+            }
+            let unchangedHandled = old?.active == true && old?.signature == signature
+                && (old?.handled == true || isolatedSignal)
             signals[key] = .init(signature: signature, active: true, handled: unchangedHandled,
                 handledAt: unchangedHandled ? old?.handledAt : nil)
             guard !unchangedHandled else { continue }
-            if unreadRecheckDue {
-                discoveryLog("discovery-unread-signal-recheck", detail: "signal=\(key); persistent unread recheck after 30s; identical previews may coalesce")
-            }
             let id = PDDPendingDiscoveryStore.retain(locator: locator, occurrence: occurrence,
                 unread: true, at: now(), in: &tasks)
             if let index = tasks.firstIndex(where: { $0.id == id }) {
@@ -243,7 +243,7 @@ final class PDDAXConversationDriver: PDDConversationOpening {
         try signalStore.save(signals)
         // Persist the trigger before a click can clear Pinduoduo's unread dot.
         if tasks != originalTasks { try discoveryStore.save(tasks) }
-        for pending in tasks where pending.nextAttemptAt <= now() {
+        for pending in tasks where pending.identityConflictAt == nil && pending.nextAttemptAt <= now() {
             guard let index = tasks.firstIndex(where: { $0.id == pending.id }) else { continue }
             guard var row = pendingRow(pending, in: rows) else {
                 tasks[index].nextAttemptAt = now().addingTimeInterval(15)
@@ -290,7 +290,7 @@ final class PDDAXConversationDriver: PDDConversationOpening {
                 task.lastSelectionAt = now()
                 tasks[tasks.count - 1].lastSelectionAt = now()
                 try discoveryStore.save(tasks)
-                try backend.performPress(row.rowID)
+                row = try pressConversationRow(row)
                 discoveryLog("discovery-row-selected", detail: "task=\(task.id) attempt=\(task.attempts) age=\(Int(age))s")
                 // Keep ownership while AX catches up; readiness, not a fixed sleep,
                 // ends the probe. The budget bounds one customer's UI occupancy.
@@ -313,14 +313,29 @@ final class PDDAXConversationDriver: PDDConversationOpening {
                 discoveryLog("discovery-selected-chat-loading", detail: "task=\(task.id) expected=\(task.locator.nickname) observed=\(current?.nickname ?? "unknown") messages=\(customerIDs(in: tree).count); readiness not confirmed; task retained")
                 return []
             }
+            let expected = try task.resolvedUID.map { try identities.canonicalUID($0) }
+            if let expected, let owner = verifiedActiveOwner(in: tree, locator: locator), owner != expected {
+                let fresh = isAllowed(owner) && hasNewVisibleCustomer(uid: owner, in: tree)
+                if fresh {
+                    // The old unread trigger belongs to an unverified row. The
+                    // new messages are independently proven by the active pane.
+                    try stageVerifiedCapture(uid: owner, locator: locator, tree: tree, unread: false)
+                    rememberLocator(locator, uid: owner)
+                    discoveryLog("discovery-current-owner-captured", uid: owner, detail: "stale_task=\(task.id)")
+                }
+                try isolateDiscoveryIdentityConflict(task, in: &tasks, tree: tree)
+                if fresh {
+                    return [.init(uid: owner, hasUnreadEvidence: false, hasUncapturedCustomerMessages: true)]
+                }
+                return []
+            }
             guard let uid = try resolveForDiscovery(in: tree, locator: locator, task: task) else {
                 recordCaptureDiagnostic("identity-unresolved", task: task, tree: tree)
                 noteSettling(key: task.id.uuidString, label: locator.nickname)
                 return []
             }
-            if let expected = task.resolvedUID, try identities.canonicalUID(expected) != uid {
-                recordCaptureDiagnostic("resolved-owner-changed", task: task, tree: tree)
-                discoveryLog("discovery-task-identity-deferred", detail: "task=\(task.id); resolved customer changed; original task retained")
+            if let expected, expected != uid {
+                try isolateDiscoveryIdentityConflict(task, in: &tasks, tree: tree)
                 return []
             }
             let legacyUID = PDDCustomerIdentity.resolve(from: tree.rootSnapshot)
@@ -360,7 +375,7 @@ final class PDDAXConversationDriver: PDDConversationOpening {
             }
             let locator = PDDConversationLocator(domIdentifier: row.domIdentifier, nickname: row.visibleLabel)
             // A pending row has its own retry schedule; do not busy-loop or reset its grace.
-            if tasks.contains(where: { task in
+            let matchingTasks = tasks.filter { task in
                 if let left = task.locator.normalizedIdentifier, let right = locator.normalizedIdentifier {
                     return left == right
                 }
@@ -368,7 +383,9 @@ final class PDDAXConversationDriver: PDDConversationOpening {
                 // unrelated active customer's red-dot-free message check.
                 return task.locator.normalizedNickname == locator.normalizedNickname
                     && pendingRow(task, in: rows)?.rowID == row.rowID
-            }) { return [] }
+            }
+            if matchingTasks.contains(where: { $0.identityConflictAt == nil }) { return [] }
+            if !matchingTasks.isEmpty, verifiedActiveOwner(in: tree, locator: locator) == nil { return [] }
             guard let uid = try resolveForDiscovery(in: tree, locator: locator) else {
                 let id = PDDPendingDiscoveryStore.retain(locator: locator, occurrence: 0,
                     unread: false, at: now(), in: &tasks)
@@ -429,7 +446,7 @@ final class PDDAXConversationDriver: PDDConversationOpening {
         guard retained != tasks else { return }
         // Save signal disposition first. A crash before queue removal can only
         // cause another inspection, never an unrecorded message loss.
-        for task in tasks where !retained.contains(where: { $0.id == task.id }) {
+        for task in tasks where task.identityConflictAt == nil && !retained.contains(where: { $0.id == task.id }) {
             try signalStore.finish(task, at: now())
         }
         try discoveryStore.save(retained)
@@ -444,6 +461,19 @@ final class PDDAXConversationDriver: PDDConversationOpening {
             discoveryLog(capture.batch == nil ? "discovery-inspection-no-work" : "discovery-capture-confirmed", uid: capture.uid,
                          detail: "task=\(task.id); receipts and trigger evidence checked; pending trigger released")
         }
+    }
+
+    private func isolateDiscoveryIdentityConflict(_ task: PDDPendingDiscovery, in tasks: inout [PDDPendingDiscovery],
+                                                   tree: PDDAXSemanticTree) throws {
+        guard let index = tasks.firstIndex(where: { $0.id == task.id }) else { return }
+        recordCaptureDiagnostic("resolved-owner-changed", task: task, tree: tree)
+        tasks[index].identityConflictAt = now()
+        try discoveryStore.save(tasks)
+        try signalStore.finish(task, at: now())
+        conversationDiagnostics.append(.init(uid: task.resolvedUID ?? "identity-pending",
+            kind: "conversation-identity-attention",
+            detail: "会话身份与原任务不同；已保留原任务，等待新证据或人工核对"))
+        discoveryLog("discovery-task-identity-isolated", detail: "task=\(task.id); unchanged evidence will not reopen chat")
     }
 
     private func recordCaptureDiagnostic(_ reason: String, task: PDDPendingDiscovery?, tree: PDDAXSemanticTree) {
@@ -575,9 +605,11 @@ final class PDDAXConversationDriver: PDDConversationOpening {
                 normalizedNickname($0.visibleLabel) == locator.normalizedNickname
             }
             if let identifierMatch {
-                try backend.performPress(identifierMatch.rowID)
-                tree = try await waitForRecipient(uid: uid, expected: expectedCustomerMessageIDs)
-                if let reason = recipientVerificationReason(uid: uid, expectedCustomerMessageIDs: expectedCustomerMessageIDs, in: tree),
+                _ = try pressConversationRow(identifierMatch)
+                let observation = try await waitForRecipient(uid: uid, expected: expectedCustomerMessageIDs, previous: tree)
+                tree = observation.tree
+                if !observation.previousPaneStillVisible,
+                   let reason = recipientVerificationReason(uid: uid, expectedCustomerMessageIDs: expectedCustomerMessageIDs, in: tree),
                    isReadableChatSurface(tree) {
                     logRecipientVerification(uid: uid, reason: reason, tree: tree)
                     return tree
@@ -602,10 +634,12 @@ final class PDDAXConversationDriver: PDDConversationOpening {
                 let exactRow = candidate.domIdentifier.flatMap { identifier in
                     refreshedRows.first { $0.domIdentifier == identifier }
                 }
-                guard let selected = exactRow ?? (refreshedMatches.indices.contains(position) ? refreshedMatches[position] : nil)
+                guard var selected = exactRow ?? (refreshedMatches.indices.contains(position) ? refreshedMatches[position] : nil)
                 else { continue }
-                try backend.performPress(selected.rowID)
-                tree = try await waitForRecipient(uid: uid, expected: expectedCustomerMessageIDs)
+                selected = try pressConversationRow(selected)
+                let observation = try await waitForRecipient(uid: uid, expected: expectedCustomerMessageIDs, previous: tree)
+                tree = observation.tree
+                guard !observation.previousPaneStillVisible else { continue }
                 // An expired row identifier can refresh only when actual
                 // customer-message evidence independently identifies the chat.
                 let previousLocator = conversationLocatorsByUID[uid]
@@ -642,26 +676,69 @@ final class PDDAXConversationDriver: PDDConversationOpening {
                 (targetLabel == nil || candidate.visibleLabel == targetLabel)
                     && visitedRowIDs.insert(candidate.rowID).inserted
             }) else { break }
-            try backend.performPress(row.rowID)
-            tree = try await waitForRecipient(uid: uid, expected: expectedCustomerMessageIDs)
-            if PDDCustomerIdentity.resolve(from: tree.rootSnapshot) == uid { return tree }
+            _ = try pressConversationRow(row)
+            let observation = try await waitForRecipient(uid: uid, expected: expectedCustomerMessageIDs, previous: tree)
+            tree = observation.tree
+            if !observation.previousPaneStillVisible,
+               PDDCustomerIdentity.resolve(from: tree.rootSnapshot) == uid { return tree }
         }
         throw PDDAXConversationDriverError.uidNotFound(uid)
     }
 
-    private func waitForRecipient(uid: String, expected: Set<String>) async throws -> PDDAXSemanticTree {
+    /// Selection is safe to repeat; Send and transfer commits never use this.
+    /// Retry once only after obtaining new AX tokens and an unambiguous row.
+    private func pressConversationRow(_ row: PDDConversationRow<AXElementToken>) throws -> PDDConversationRow<AXElementToken> {
+        do {
+            try backend.performPress(row.rowID)
+            return row
+        } catch let error as PDDAXBackendError {
+            switch error {
+            case .staleElement, .actionFailed(.invalidUIElement), .actionFailed(.cannotComplete): break
+            default: throw error
+            }
+            try Task.checkCancellation()
+            let fresh = try backend.readSemanticTree()
+            let rows = try PDDAXControlSelection.conversationRows(in: fresh.nodes)
+            let matches = rows.filter { candidate in
+                if let identifier = row.domIdentifier { return candidate.domIdentifier == identifier }
+                return normalizedNickname(candidate.visibleLabel) == normalizedNickname(row.visibleLabel)
+            }
+            guard matches.count == 1, let selected = matches.first else { throw error }
+            discoveryLog("conversation-row-press-retry", detail: "fresh AX row; bounded retry=1")
+            try backend.performPress(selected.rowID)
+            return selected
+        }
+    }
+
+    private func waitForRecipient(uid: String, expected: Set<String>, previous: PDDAXSemanticTree)
+        async throws -> (tree: PDDAXSemanticTree, previousPaneStillVisible: Bool) {
         let deadline = ContinuousClock.now.advanced(by: .milliseconds(1500))
+        let previousIDs = customerIDs(in: previous).filter { $0.hasPrefix("middlePanel_list_") }
+        let previousUID = PDDCustomerIdentity.resolve(from: previous.rootSnapshot)
+        let previousProof = recipientVerificationReason(uid: uid, expectedCustomerMessageIDs: expected, in: previous)
         var tree = try backend.readSemanticTree()
+        var loggedSettling = false
         while true {
             try Task.checkCancellation()
-            // A loaded but wrong candidate must be rejected by the caller,
-            // not polled until it accidentally becomes a different candidate.
-            if PDDAXCaptureSurface.hasReadableMessages(in: tree)
-                || PDDCustomerIdentity.resolve(from: tree.rootSnapshot) != nil
-                || PDDAXIncomingTransfer.unansweredHandoff(in: tree.rootSnapshot) != nil { return tree }
             let proof = recipientVerificationReason(uid: uid, expectedCustomerMessageIDs: expected, in: tree)
-            if proof == "ax-conversation-id" || (!expected.isEmpty && proof != nil) { return tree }
-            if ContinuousClock.now >= deadline { return tree }
+            let currentUID = PDDCustomerIdentity.resolve(from: tree.rootSnapshot)
+            let showsPreviousPane = previousProof == nil && proof != "ax-customer-message-id" && (
+                !previousIDs.isDisjoint(with: customerIDs(in: tree))
+                || (previousUID != nil && previousUID == currentUID && currentUID != uid)
+            )
+            // A row press can leave the earlier chat readable while the new
+            // pane loads. A genuinely different, loaded candidate can move on.
+            if showsPreviousPane && !loggedSettling {
+                loggedSettling = true
+                AutomationStepLog.record(root: chatStore.rootDirectory, uid: uid, step: "reply-target-ax-settling",
+                    detail: "Previous message pane still visible after selecting conversation")
+            }
+            let readable = PDDAXCaptureSurface.hasReadableMessages(in: tree)
+                || currentUID != nil
+                || PDDAXIncomingTransfer.unansweredHandoff(in: tree.rootSnapshot) != nil
+                || proof == "ax-conversation-id" || (!expected.isEmpty && proof != nil)
+            if !showsPreviousPane && readable { return (tree, false) }
+            if ContinuousClock.now >= deadline { return (tree, showsPreviousPane) }
             try await Task.sleep(nanoseconds: 120_000_000)
             tree = try backend.readSemanticTree()
         }
@@ -735,6 +812,12 @@ final class PDDAXConversationDriver: PDDConversationOpening {
         }
     }
 
+    private func verifiedActiveOwner(in tree: PDDAXSemanticTree, locator: PDDConversationLocator) -> String? {
+        guard hasSingleActiveChat(tree) else { return nil }
+        return try? identities.owner(messageIDs: customerIDs(in: tree), stableID: locator.normalizedIdentifier,
+            boundary: PDDAXIncomingTransfer.incomingRecord(in: tree.rootSnapshot)?.identityBoundaryKey)
+    }
+
     private func resolveDiscoveredUID(in tree: PDDAXSemanticTree, locator: PDDConversationLocator, task: PDDPendingDiscovery? = nil) throws -> String? {
         let ids = customerIDs(in: tree)
         let incoming = PDDAXIncomingTransfer.incomingRecord(in: tree.rootSnapshot)
@@ -788,6 +871,9 @@ final class PDDAXConversationDriver: PDDConversationOpening {
             recordCaptureDiagnostic("recipient-proof-rejected", task: task, tree: tree)
             return nil
         }
+        // A retry may infer a candidate while the old task expects another
+        // customer. Only independently registered evidence can override it.
+        if let expected = task?.resolvedUID, try identities.canonicalUID(expected) != uid { return uid }
         if isReadableChatSurface(tree), legacy == nil {
             try identities.remember(uid: uid, messageIDs: ids, stableID: locator.normalizedIdentifier, boundary: boundary,
                 provisional: uid.hasPrefix("PDD-CHAT-") && locator.normalizedIdentifier == nil && boundary == nil, at: now())

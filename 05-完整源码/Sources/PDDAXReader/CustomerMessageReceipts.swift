@@ -11,6 +11,7 @@ struct CustomerMessageReceipts: Sendable {
         var submittedAt: Date?
         var completedAt: Date?
         var replySentAt: Date?
+        var videoFallbackSentAt: Date?
         var batchKey: String?
         var promptSHA256: String?
         var submissionID: UUID?
@@ -44,6 +45,20 @@ struct CustomerMessageReceipts: Sendable {
         Self.lock.lock()
         defer { Self.lock.unlock() }
         return try load().customers[uid] ?? [:]
+    }
+
+    /// A sent product-problem question completes the failed video turn.
+    func acknowledgeVideoFallback(uid: String, messageIDs: Set<String>) throws {
+        try update { state in
+            for id in messageIDs {
+                guard var receipt = state.customers[uid]?[id],
+                      receipt.submittedAt == nil, receipt.completedAt == nil,
+                      receipt.closedAt == nil else { continue }
+                receipt.videoFallbackSentAt = receipt.videoFallbackSentAt ?? receipt.replySentAt
+                receipt.replySentAt = receipt.replySentAt ?? receipt.videoFallbackSentAt
+                state.customers[uid]?[id] = receipt
+            }
+        }
     }
 
     func awaitingSubmission() throws -> [String: Set<String>] {

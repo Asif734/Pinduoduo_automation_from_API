@@ -4,10 +4,38 @@ import CoreGraphics
 import Foundation
 import Speech
 
+protocol PinduoduoV2ReadinessProbing: Sendable {
+    func compatibilityItem() async -> PDDCompatibilityItem
+}
+
+struct LivePinduoduoV2ReadinessProbe: PinduoduoV2ReadinessProbing, Sendable {
+    let client: PinduoduoV2APIClient
+    let credentials: any PinduoduoV2CredentialProviding
+
+    init(
+        client: PinduoduoV2APIClient = PinduoduoV2APIClient(),
+        credentials: any PinduoduoV2CredentialProviding = PinduoduoV2EnvironmentCredentialProvider()
+    ) {
+        self.client = client
+        self.credentials = credentials
+    }
+
+    func compatibilityItem() async -> PDDCompatibilityItem {
+        do {
+            let key = try credentials.apiKey()
+            _ = try await client.status(apiKey: key, cacheLifetime: 0)
+            return .init(kind: .api, status: .pass, detail:
+                BilingualText.lines("拼多多 V2 API 已就绪", "Pinduoduo V2 API is ready"))
+        } catch {
+            return .init(kind: .api, status: .fail, detail: error.localizedDescription)
+        }
+    }
+}
+
 @MainActor
 enum PDDCompatibilityChecker {
     static func check(
-        codexProbe: CodexCompatibilityProbe = CodexCompatibilityProbe()
+        apiProbe: any PinduoduoV2ReadinessProbing = LivePinduoduoV2ReadinessProbe()
     ) async -> PDDCompatibilityReport {
         var items: [PDDCompatibilityItem] = []
 #if arch(arm64)
@@ -47,15 +75,7 @@ enum PDDCompatibilityChecker {
             status: pdd == nil ? .fail : .pass,
             detail: pdd == nil ? BilingualText.lines("拼多多商家工作台未运行", "Pinduoduo Merchant Workbench is not running") : BilingualText.lines("拼多多商家工作台已运行", "Pinduoduo Merchant Workbench is running")
         ))
-        do {
-            try DirectLocalKnowledge().validate()
-            items.append(.init(kind: .knowledge, status: .pass, detail:
-                BilingualText.lines("本地知识目录可直接读取", "Local knowledge folder is ready for direct reading")))
-        } catch {
-            items.append(.init(kind: .knowledge, status: .fail, detail: error.localizedDescription))
-        }
-        let codexURL = CodexInstallation.resolve()
-        items.append(await codexProbe.check(executableURL: codexURL).compatibilityItem)
+        items.append(await apiProbe.compatibilityItem())
 
         let cefRoot = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Containers/com.pinduoduo.merchantMac/PMDataRelease/Caches/cef")

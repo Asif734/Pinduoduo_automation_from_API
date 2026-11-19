@@ -113,6 +113,7 @@ protocol PDDAXBackend: AnyObject {
     func requestAccessibilityRefresh() throws
     func prepareForeground() async throws
     func readSemanticTree() throws -> PDDAXSemanticTree
+    func readSemanticTreeForObservation() throws -> PDDAXSemanticTree
     func performPress(_ id: AXElementToken) throws
     func setValue(_ text: String, on id: AXElementToken) throws
     func value(of id: AXElementToken) throws -> String
@@ -121,6 +122,7 @@ protocol PDDAXBackend: AnyObject {
 extension PDDAXBackend {
     func prepareForeground() async throws {}
     func requestAccessibilityRefresh() throws {}
+    func readSemanticTreeForObservation() throws -> PDDAXSemanticTree { try readSemanticTree() }
 }
 
 enum PDDAXBackendError: LocalizedError {
@@ -249,6 +251,14 @@ final class LivePDDAXBackend: PDDAXBackend {
     }
 
     func readSemanticTree() throws -> PDDAXSemanticTree {
+        try readSemanticTree(recoverWebTree: true)
+    }
+
+    func readSemanticTreeForObservation() throws -> PDDAXSemanticTree {
+        try readSemanticTree(recoverWebTree: false)
+    }
+
+    private func readSemanticTree(recoverWebTree: Bool) throws -> PDDAXSemanticTree {
         readDeadline = ContinuousClock().now.advanced(by: .seconds(5))
         defer { readDeadline = nil }
         guard AXIsProcessTrusted() else { throw AXTreeReaderError.accessibilityPermissionRequired }
@@ -260,7 +270,7 @@ final class LivePDDAXBackend: PDDAXBackend {
         // Synchronous AX IPC runs on the UI executor. Bound each IPC as well as
         // the whole traversal; an async watchdog cannot interrupt a blocked IPC.
         AXUIElementSetMessagingTimeout(appElement, 0.5)
-        if AXEnhancedUserInterfaceActivation.enableIfNeeded(on: appElement) {
+        if recoverWebTree, AXEnhancedUserInterfaceActivation.enableIfNeeded(on: appElement) {
             Thread.sleep(forTimeInterval: 0.2)
         }
         let titledWindows = try copyElements(kAXWindowsAttribute as String, from: appElement).map {
@@ -279,6 +289,7 @@ final class LivePDDAXBackend: PDDAXBackend {
         var nodes: [PDDAXSemanticNode<AXElementToken>] = []
         let snapshot = try walk(root, parent: nil, depth: 0, nodes: &nodes)
         try checkReadDeadline()
+        guard recoverWebTree else { return PDDAXSemanticTree(rootSnapshot: snapshot, nodes: nodes) }
         switch webTreeRecovery.evaluate(nodes: nodes, now: now()) {
         case .healthy:
             return PDDAXSemanticTree(rootSnapshot: snapshot, nodes: nodes)

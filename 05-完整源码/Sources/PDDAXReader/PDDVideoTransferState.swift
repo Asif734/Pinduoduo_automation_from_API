@@ -33,6 +33,9 @@ enum PDDVideoTransferFailureCategory: String, Codable, Equatable, Sendable {
     case legacyUnknown
 
     static func classify(_ error: Error) -> Self {
+        if let timeout = error as? OperationTimeout, timeout.stage == "video-address" {
+            return .addressUnavailable
+        }
         if let error = error as? PDDCustomerVideoError {
             switch error {
             case .clickFailed: return .previewUnavailable
@@ -59,6 +62,7 @@ enum PDDVideoTransferFailureCategory: String, Codable, Equatable, Sendable {
 
     /// Preserve a useful cause without persisting signed video URLs or request headers.
     static func diagnostic(_ error: Error) -> String {
+        if let timeout = error as? OperationTimeout { return timeout.localizedDescription }
         if let error = error as? PDDCustomerVideoError { return error.localizedDescription }
         let error = error as NSError
         return "\(error.domain) code=\(error.code)"
@@ -82,10 +86,11 @@ struct PDDDurableVideoTransferRecord: Codable, Equatable, Sendable {
 }
 
 enum PDDVideoRetryPolicy {
+    static let maximumRetries = 3
     private static let delays: [TimeInterval] = [60, 180, 600]
 
     static func delay(afterFailure index: Int) -> TimeInterval? {
-        guard delays.indices.contains(index) else { return nil }
+        guard delays.indices.contains(index), index < maximumRetries else { return nil }
         return delays[index]
     }
 }
@@ -117,6 +122,15 @@ actor PDDDurableVideoTransferStore {
     init(url: URL, now: @escaping @Sendable () -> Date = { Date() }) {
         self.url = url
         self.now = now
+    }
+
+    nonisolated static func persistedRecords(at url: URL) throws -> [PDDDurableVideoTransferRecord] {
+        guard FileManager.default.fileExists(atPath: url.path) else { return [] }
+        let payload = try JSONDecoder().decode(Payload.self, from: Data(contentsOf: url))
+        guard payload.schemaVersion == 1 else {
+            throw PDDDurableVideoTransferStoreError.unsupportedSchema(payload.schemaVersion)
+        }
+        return payload.records
     }
 
     @discardableResult

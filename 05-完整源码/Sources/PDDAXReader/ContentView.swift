@@ -38,7 +38,7 @@ struct ContentView: View {
                     .tag(ReaderTab.parsedChat)
 
                 panel(contents: model.replyOutput)
-                    .tabItem { Label(BilingualText.lines("Codex 建议回复", "Codex suggested reply"), systemImage: "sparkles") }
+                    .tabItem { Label(BilingualText.lines("托管 API 建议回复", "Hosted API suggested reply"), systemImage: "sparkles") }
                     .tag(ReaderTab.reply)
             }
         }

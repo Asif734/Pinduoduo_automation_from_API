@@ -2,6 +2,16 @@ import XCTest
 @testable import PDDAXReader
 
 final class CustomerFacingReplyPolicyTests: XCTestCase {
+    func testVideoFailureAsksAboutProductProblemInCustomerLanguage() {
+        let english = [PDDChatMessage(id: "q", sender: .customer, content: "Hello, I need help with my printer.",
+            displayTime: nil, kind: .text, capturedAt: Date())]
+        let reply = CustomerFacingFallback.productProblemQuestion(history: english)
+        XCTAssertEqual(reply, "What problem are you having with the product? Please describe what happens so I can help you troubleshoot.")
+        XCTAssertNil(CustomerFacingReplyPolicy.violation(in: reply))
+        XCTAssertEqual(CustomerFacingFallback.productProblemQuestion(history: []),
+            "请问您的产品遇到了什么问题？麻烦您描述一下具体表现，我来帮您排查。")
+    }
+
     func testVideoProcessingStatusIsBlockedButSpecificEvidenceLimitsAndChineseHoldsAreAllowed() {
         for text in ["I can’t view the video here.", "Your video is still loading.", "我这边无法查看视频。", "您的视频还在加载。"] {
             XCTAssertEqual(CustomerFacingReplyPolicy.violation(in: text), "video processing status")

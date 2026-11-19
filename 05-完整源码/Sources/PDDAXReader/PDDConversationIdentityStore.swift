@@ -89,7 +89,8 @@ struct PDDConversationIdentityStore {
 
     /// Caller must independently verify one active chat surface. Every owner
     /// must contribute actual customer IDs in that same tree, not just a label
-    /// or an old transfer notice. Only provisional CHAT records can be absorbed.
+    /// or an old transfer notice. A label-only singleton from a partial AX read
+    /// can also be absorbed when another established record anchors the thread.
     func reconcileVerifiedThread(messageIDs: Set<String>, stableID: String?, boundary: String?) throws -> Repair? {
         var state = try load()
         let owners = matches(state, messageIDs: messageIDs, stableID: stableID, boundary: boundary)
@@ -104,8 +105,16 @@ struct PDDConversationIdentityStore {
                   entry.stableIDs.isEmpty, entry.incomingBoundaries.isEmpty else { return false }
             return entry.provisional == true || (entry.provisional == nil && entry.messageIDs.count == 1)
         }
-        let established = owners.filter { !provisional($0) }
+        func namedSingleton(_ uid: String) -> Bool {
+            guard uid.hasPrefix("PDD-NAME-"), let entry = state.owners[uid] else { return false }
+            return entry.messageIDs.count == 1 && entry.stableIDs.isEmpty && entry.incomingBoundaries.isEmpty
+        }
+        let nonProvisional = owners.filter { !provisional($0) }
+        let established = nonProvisional.count <= 1 ? nonProvisional : nonProvisional.filter { !namedSingleton($0) }
         guard established.count <= 1 else { throw IdentityError.conflictingEvidence }
+        // Two unrelated one-message named records do not establish which
+        // customer owns the chat. Preserve the conflict instead of guessing.
+        guard !established.isEmpty || nonProvisional.isEmpty else { throw IdentityError.conflictingEvidence }
         let canonicalUID = established.first ?? owners.sorted {
             if let left = state.owners[$0]?.createdAt, let right = state.owners[$1]?.createdAt, left != right { return left < right }
             let left = state.owners[$0]?.messageIDs.count ?? 0
@@ -113,7 +122,7 @@ struct PDDConversationIdentityStore {
             return left == right ? $0 < $1 : left > right
         }[0]
         let aliases = Set(owners).subtracting([canonicalUID])
-        guard aliases.allSatisfy({ provisional($0) && state.owners[$0]!.messageIDs.isSubset(of: messageIDs) }) else {
+        guard aliases.allSatisfy({ (provisional($0) || namedSingleton($0)) && state.owners[$0]!.messageIDs.isSubset(of: messageIDs) }) else {
             throw IdentityError.conflictingEvidence
         }
         var combined = state.owners[canonicalUID]!

@@ -345,6 +345,7 @@ private final class ImageDeliveryBackend: PDDAXBackend {
     var previewPressLeavesOpen = false
     var failTextWrite = false
     var composer = ""
+    var sentText: String?
     var textSendCount = 0
     var previewSendCount = 0
     var previewCancelCount = 0
@@ -379,8 +380,19 @@ private final class ImageDeliveryBackend: PDDAXBackend {
         }
         let rows = activeNickname.map { nickname in [AXNodeSnapshot(role: "AXGroup", attributes: [("AXDOMClassList", "[chat-item-box,active]")], children: [
             .init(role: "AXStaticText", attributes: [("AXDOMClassList", "[chat-nickname]"), ("AXValue", nickname)])])] } ?? []
+        let sentBubble = sentText.map { text in
+            AXNodeSnapshot(role: "AXGroup", attributes: [
+                ("AXDOMIdentifier", "middlePanel_list_text_sent"), ("AXDOMClassList", "[onemsg]")
+            ], children: [
+                .init(role: "AXGroup", attributes: [("AXDOMClassList", "[cs-item]")], children: [
+                    .init(role: "AXGroup", attributes: [
+                        ("AXDOMClassList", "[msg-content-box]"), ("AXValue", text)
+                    ])
+                ])
+            ])
+        }
         return PDDAXSemanticTree(rootSnapshot: AXNodeSnapshot(role: "AXWindow", attributes: [("AXValue", uid)],
-            children: rows + (imageVisible ? [image] : [])), nodes: nodes)
+            children: rows + (imageVisible ? [image] : []) + (sentBubble.map { [$0] } ?? [])), nodes: nodes)
     }
     func performPress(_ token: AXElementToken) throws {
         if token.rawValue == 25 { previewCancelCount += 1; previewVisible = false }
@@ -388,7 +400,7 @@ private final class ImageDeliveryBackend: PDDAXBackend {
             previewSendCount += 1
             if !previewPressLeavesOpen { previewVisible = false; imageVisible = true }
         }
-        else { textSendCount += 1; composer = "" }
+        else { textSendCount += 1; sentText = composer; composer = "" }
     }
     func setValue(_ text: String, on token: AXElementToken) throws {
         if failTextWrite { throw CocoaError(.fileWriteUnknown) }

@@ -477,6 +477,47 @@ final class PDDAXConversationDriverTests: XCTestCase {
         XCTAssertEqual(backend.pressedIDs, [.init(rawValue: 2), .init(rawValue: 4)])
     }
 
+    func testOpeningWaitsForStalePreviousPaneToClearAfterPress() async throws {
+        let locator = PDDConversationLocator(nickname: "c***")
+        let uid = PDDConversationKey.make(locator: locator)
+        let rows = [semantic(1, role: "AXGroup", classes: ["chat-list-box"]),
+            semantic(2, parent: 1, role: "AXGroup", actions: ["AXPress"]),
+            semantic(3, parent: 2, role: "AXStaticText", value: "c***")]
+        let stale = PDDAXSemanticTree(rootSnapshot: .init(role: "AXWindow", children: [customer("previous")]),
+            nodes: rows + usableChatTree().nodes)
+        let ready = PDDAXSemanticTree(rootSnapshot: .init(role: "AXWindow", children: [customer("target")]),
+            nodes: rows + usableChatTree().nodes)
+        let backend = FakePDDAXBackend(trees: [stale, stale, ready])
+        let driver = makeDriver(backend: backend, allowedUIDs: nil)
+        driver.restoreConversationLocators([uid: locator])
+
+        let opened = try await driver.openAndResolve(uid: uid, expectedCustomerMessageIDs: ["middlePanel_list_target"])
+
+        XCTAssertEqual(PDDChatParser.parse(root: opened.rootSnapshot).messages.map(\.id), ["middlePanel_list_target"])
+        XCTAssertEqual(backend.pressedIDs, [.init(rawValue: 2)])
+    }
+
+    func testAnUpdatedSelectedLabelDoesNotVerifyThePreviousMessagePane() async throws {
+        let locator = PDDConversationLocator(nickname: "c***")
+        let uid = PDDConversationKey.make(locator: locator)
+        let previous = verifiedChatTree(nickname: "a***", messages: [customer("previous")])
+        let selected = verifiedChatTree(nickname: "c***", messages: [customer("previous")])
+        let rows = [semantic(1, role: "AXGroup", classes: ["chat-list-box"]),
+            semantic(2, parent: 1, role: "AXGroup", actions: ["AXPress"]),
+            semantic(3, parent: 2, role: "AXStaticText", value: "c***")]
+        let stale = PDDAXSemanticTree(rootSnapshot: selected.rootSnapshot, nodes: rows + selected.nodes)
+        let ready = verifiedChatTree(nickname: "c***", messages: [customer("target")])
+        let listed = PDDAXSemanticTree(rootSnapshot: previous.rootSnapshot, nodes: stale.nodes)
+        let backend = FakePDDAXBackend(trees: [listed, stale, ready])
+        let driver = makeDriver(backend: backend, allowedUIDs: nil)
+        driver.restoreConversationLocators([uid: locator])
+
+        let opened = try await driver.openAndResolve(uid: uid, expectedCustomerMessageIDs: ["middlePanel_list_target"])
+
+        XCTAssertEqual(PDDChatParser.parse(root: opened.rootSnapshot).messages.map(\.id), ["middlePanel_list_target"])
+        XCTAssertEqual(backend.pressedIDs.count, 1)
+    }
+
     func testNicknameFallbackRefreshesRowTokensBetweenAXReads() async throws {
         let locator = PDDConversationLocator(nickname: "c***")
         let uid = PDDConversationKey.make(locator: locator)
@@ -518,7 +559,7 @@ final class PDDAXConversationDriverTests: XCTestCase {
         let backend = FakePDDAXBackend(trees: [
             PDDAXSemanticTree(rootSnapshot: AXNodeSnapshot(role: "AXWindow"), nodes: rows),
             wrong,
-            wrong,
+            .init(rootSnapshot: .init(role: "AXWindow", children: [customer("other-wrong")]), nodes: rows + usableChatTree().nodes),
             .init(rootSnapshot: AXNodeSnapshot(role: "AXWindow", children: [customer("target")]), nodes: rows + usableChatTree().nodes)
         ])
         let driver = makeDriver(backend: backend, allowedUIDs: nil)

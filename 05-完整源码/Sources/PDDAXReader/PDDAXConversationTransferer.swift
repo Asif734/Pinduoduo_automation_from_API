@@ -6,6 +6,15 @@ protocol PDDLiveConversationTransferring: AnyObject {
     func transferToAnyHuman(
         uid: String, lease: UIOperationLease
     ) async throws -> AutoReplyTransferResult
+    func transferHostedFailure(uid: String, expectedCustomerMessageIDs: Set<String>,
+                               lease: UIOperationLease) async throws -> AutoReplyTransferResult
+}
+
+extension PDDLiveConversationTransferring {
+    func transferHostedFailure(uid: String, expectedCustomerMessageIDs: Set<String>,
+                               lease: UIOperationLease) async throws -> AutoReplyTransferResult {
+        .failed("转接执行器无法核对托管失败批次")
+    }
 }
 
 @MainActor
@@ -22,6 +31,10 @@ extension PDDTransferClicking {
 struct PDDTransferPrecommitError: LocalizedError {
     let detail: String
     var errorDescription: String? { detail }
+}
+
+private struct PDDHostedTransferAlreadyAnswered: LocalizedError {
+    var errorDescription: String? { "待转接消息之后已有客服回复；请人工核对是否仍需转接" }
 }
 
 enum PDDConversationTransferError: LocalizedError {
@@ -69,27 +82,44 @@ final class PDDAXConversationTransferer: PDDLiveConversationTransferring {
     ) async throws -> AutoReplyTransferResult {
         AutomationStepLog.record(root: logRoot, uid: uid, step: "transfer-open-started", detail: "target=after-sales")
         do {
-            return try await transferToAfterSales(uid: uid, lease: lease)
+            return try await transferToAfterSales(uid: uid, expectedTargets: nil, lease: lease)
         } catch {
             AutomationStepLog.record(root: logRoot, uid: uid, step: "transfer-error", detail: error.localizedDescription)
             throw error
         }
     }
 
-    private func transferToAfterSales(uid: String, lease: UIOperationLease) async throws -> AutoReplyTransferResult {
+    func transferHostedFailure(uid: String, expectedCustomerMessageIDs: Set<String>,
+                               lease: UIOperationLease) async throws -> AutoReplyTransferResult {
+        guard !expectedCustomerMessageIDs.isEmpty else { return .failed("缺少待转接的客户消息") }
+        do {
+            return try await transferToAfterSales(uid: uid, expectedTargets: expectedCustomerMessageIDs, lease: lease)
+        } catch let error as PDDHostedTransferAlreadyAnswered {
+            return .failed(error.localizedDescription)
+        }
+    }
+
+    private func transferToAfterSales(uid: String, expectedTargets: Set<String>?,
+                                      lease: UIOperationLease) async throws -> AutoReplyTransferResult {
         try lease.validate()
         var tree: PDDAXSemanticTree
         do {
             try await backend.prepareForeground()
             try lease.validate()
-            tree = try await opener.openAndResolve(uid: uid)
+            if let expectedTargets {
+                tree = try await opener.openAndResolve(uid: uid, expectedCustomerMessageIDs: expectedTargets)
+            } else {
+                tree = try await opener.openAndResolve(uid: uid)
+            }
         }
         catch is CancellationError { throw CancellationError() }
         catch { throw PDDTransferPrecommitError(detail: error.localizedDescription) }
         try lease.validate()
 
+        if let expectedTargets { try verifyHostedTransferTargets(expectedTargets, in: tree) }
+
         if !PDDAXControlSelection.isTransferDialogVisible(in: tree.nodes) {
-            tree = try await openDialog(uid: uid, initial: tree, lease: lease)
+            tree = try await openDialog(uid: uid, initial: tree, expectedTargets: expectedTargets, lease: lease)
         }
         AutomationStepLog.record(root: logRoot, uid: uid, step: "transfer-dialog-opened")
         defer {
@@ -169,7 +199,19 @@ final class PDDAXConversationTransferer: PDDLiveConversationTransferring {
         }
     }
 
-    private func openDialog(uid: String, initial: PDDAXSemanticTree, lease: UIOperationLease) async throws -> PDDAXSemanticTree {
+    private func verifyHostedTransferTargets(_ expectedTargets: Set<String>, in tree: PDDAXSemanticTree) throws {
+        let messages = PDDChatParser.parse(root: tree.rootSnapshot).messages
+        let visibleTargets = Set(messages.filter { $0.sender == .customer }.map(\.id))
+        guard expectedTargets.isSubset(of: visibleTargets),
+              let target = messages.lastIndex(where: { $0.sender == .customer && expectedTargets.contains($0.id) })
+        else { throw PDDTransferPrecommitError(detail: "无法在当前会话核对全部待转接消息") }
+        guard !messages.dropFirst(target + 1).contains(where: { $0.sender == .service }) else {
+            throw PDDHostedTransferAlreadyAnswered()
+        }
+    }
+
+    private func openDialog(uid: String, initial: PDDAXSemanticTree, expectedTargets: Set<String>?,
+                            lease: UIOperationLease) async throws -> PDDAXSemanticTree {
         var tree = initial
         for attempt in 1...3 {
             try lease.validate()
@@ -178,7 +220,12 @@ final class PDDAXConversationTransferer: PDDLiveConversationTransferring {
                 try lease.validate()
                 tree = try backend.readSemanticTree()
                 if PDDAXControlSelection.isTransferDialogVisible(in: tree.nodes) { return tree }
-                tree = try await opener.openAndResolve(uid: uid)
+                if let expectedTargets {
+                    tree = try await opener.openAndResolve(uid: uid, expectedCustomerMessageIDs: expectedTargets)
+                    try verifyHostedTransferTargets(expectedTargets, in: tree)
+                } else {
+                    tree = try await opener.openAndResolve(uid: uid)
+                }
             }
             try lease.validate()
             if PDDAXControlSelection.isTransferDialogVisible(in: tree.nodes) { return tree }

@@ -3,6 +3,57 @@ import XCTest
 
 @MainActor
 final class PDDConversationIdentityTests: XCTestCase {
+    func testVerifiedThreadRepairsNamedSingletonCreatedByPartialRead() throws {
+        let root = temporary(); defer { try? FileManager.default.removeItem(at: root) }
+        let registry = PDDConversationIdentityStore(root: root)
+        let canonical = PDDConversationKey.make(locator: .init(nickname: "A***"))
+        let alias = PDDConversationKey.make(locator: .init(nickname: "A**"))
+        try registry.remember(uid: canonical, messageIDs: ["middlePanel_list_old", "middlePanel_list_older"], stableID: nil, boundary: "handoff")
+        try registry.remember(uid: alias, messageIDs: ["middlePanel_list_new"], stableID: nil, boundary: nil)
+        let driver = PDDAXConversationDriver(backend: Backend([]), chatStore: .init(rootDirectory: root), allowedUIDs: nil)
+        try driver.reconcileVisibleIdentity(in: tree("A***", ids: ["old", "new"]))
+        XCTAssertEqual(try registry.canonicalUID(alias), canonical)
+        XCTAssertEqual(try PDDConversationIdentityStore(root: root).owner(messageIDs: ["middlePanel_list_new"]), canonical)
+        XCTAssertEqual(Set(try PerUserChatStore(rootDirectory: root).loadAXFirst(uid: canonical).map(\.id)), ["middlePanel_list_old", "middlePanel_list_new"])
+        XCTAssertNotNil(driver.recipientVerificationReason(uid: canonical, expectedCustomerMessageIDs: ["middlePanel_list_new"], in: tree("A***", ids: ["old", "new"])))
+    }
+
+    func testNamedAliasWithUnseenHistoryCannotBeAbsorbed() throws {
+        let root = temporary(); defer { try? FileManager.default.removeItem(at: root) }
+        let registry = PDDConversationIdentityStore(root: root)
+        let canonical = PDDConversationKey.make(locator: .init(nickname: "A***"))
+        let alias = PDDConversationKey.make(locator: .init(nickname: "A**"))
+        try registry.remember(uid: canonical, messageIDs: ["old"], stableID: nil, boundary: "handoff")
+        try registry.remember(uid: alias, messageIDs: ["new", "unseen"], stableID: nil, boundary: nil)
+        XCTAssertThrowsError(try registry.reconcileVerifiedThread(messageIDs: ["old", "new"], stableID: nil, boundary: nil))
+        XCTAssertEqual(try registry.canonicalUID(alias), alias)
+    }
+
+    func testUncertainNamedAliasDeliveryReconcilesCanonicalChatWithoutSending() async throws {
+        let root = temporary(); defer { try? FileManager.default.removeItem(at: root) }
+        let registry = PDDConversationIdentityStore(root: root)
+        let canonical = PDDConversationKey.make(locator: .init(nickname: "A***"))
+        let alias = PDDConversationKey.make(locator: .init(nickname: "A**"))
+        try registry.remember(uid: canonical, messageIDs: ["middlePanel_list_old"], stableID: nil, boundary: "handoff")
+        try registry.remember(uid: alias, messageIDs: ["middlePanel_list_new"], stableID: nil, boundary: nil)
+        _ = try registry.reconcileVerifiedThread(messageIDs: ["middlePanel_list_old", "middlePanel_list_new"], stableID: nil, boundary: nil)
+        let current = tree("A***", ids: ["old", "new"])
+        let posted = AXNodeSnapshot(role: "AXGroup", attributes: [("AXDOMClassList", "[onemsg]"), ("AXDOMIdentifier", "middlePanel_list_posted")], children: [
+            .init(role: "AXGroup", attributes: [("AXDOMClassList", "[cs-item]")], children: [
+                .init(role: "AXGroup", attributes: [("AXDOMClassList", "[msg-content-box]"), ("AXValue", "answer")])])])
+        let snapshot = AXNodeSnapshot(role: current.rootSnapshot.role, attributes: current.rootSnapshot.attributes, children: current.rootSnapshot.children + [posted])
+        let backend = Backend([.init(rootSnapshot: snapshot, nodes: current.nodes)])
+        let driver = PDDAXConversationDriver(backend: backend, chatStore: .init(rootDirectory: root), allowedUIDs: nil)
+        driver.restoreConversationLocators([canonical: .init(nickname: "A***")])
+        let id = UUID()
+        try PDDTextDeliveryAttemptStore(root: root).save(.init(uid: alias, replySHA256: PDDTextDeliveryAttempt.hash("answer"), stage: .commitIntent, updatedAt: Date()), id: id)
+        let sender = PDDAXReplySender(backend: backend, opener: driver, logRoot: root)
+        let result = try await sender.reconcileTextDelivery(uid: alias, text: "answer", deliveryID: id, expectedCustomerMessageIDs: ["middlePanel_list_new"])
+        XCTAssertEqual(result, .sent(serviceMessageID: "middlePanel_list_posted"))
+        XCTAssertTrue(backend.pressed.isEmpty)
+        XCTAssertEqual(try PDDTextDeliveryAttemptStore(root: root).load(id)?.uid, alias)
+    }
+
     func testTransferRecordRetainsIdentityAfterReplyAndGenericNoticeTextIsNotGlobalIdentity() throws {
         let before = customerNode("before")
         let service = AXNodeSnapshot(role: "AXGroup", attributes: [("AXDOMClassList", "[onemsg]"), ("AXDOMIdentifier", "service-after")], children: [
@@ -226,6 +277,162 @@ final class PDDConversationIdentityTests: XCTestCase {
         XCTAssertFalse(driver.sentTexts.contains { $0.hasPrefix("stale") })
         let generated = await generator.recorded()
         XCTAssertEqual(generated.first?.batch?.customerMessageIDs, recovered.capture.batch?.customerMessageIDs)
+    }
+
+    func testAliasRecoveryRebuildsUnsentTargetsBeforeAnsweredCursorAndDeliversOnceAfterRestart() async throws {
+        let root = temporary(); defer { try? FileManager.default.removeItem(at: root) }
+        let canonical = PDDConversationKey.make(locator: .init(nickname: "A***"))
+        let alias = PDDConversationKey.make(locator: .init(nickname: "A**"))
+        let old = message("old-pending", "hello")
+        let context = message("context-only", "older context without a receipt")
+        let answered = message("answered", "already answered")
+        let newest = message("new", "hello today")
+        let history = [old, context, answered, newest]
+        let timeline = try AutoReplyTimeline.make(messages: history)
+        let cursor = try XCTUnwrap(timeline.prefixCursor(at: 3))
+        func capture(_ uid: String, _ messages: [PDDChatMessage]) throws -> AutoReplyCapture {
+            let target = try AutoReplyTimeline.make(messages: messages)
+            return .init(uid: uid, fullHistory: messages, batch: try target.freeze(after: .empty),
+                customerCursor: target.cursor, unexpectedServiceMessageIDs: [])
+        }
+        func pending(_ capture: AutoReplyCapture, _ sequence: Int, state: AutoReplyJobState = .ready) -> AutoReplyJob {
+            .init(id: UUID(), uid: capture.uid, sequence: sequence, state: state, capture: capture,
+                reply: state == .ready ? "stale reply" : nil, deliveryOutcome: .notSent,
+                confirmedServiceMessageID: nil, retries: 0, nextAttemptAt: nil, lastError: nil)
+        }
+        let registry = PDDConversationIdentityStore(root: root)
+        try registry.remember(uid: canonical, messageIDs: [old.id, context.id, answered.id], stableID: nil, boundary: nil)
+        try registry.remember(uid: alias, messageIDs: [newest.id], stableID: nil, boundary: nil)
+        _ = try registry.reconcileVerifiedThread(messageIDs: [old.id, newest.id], stableID: nil, boundary: nil)
+        _ = try PerUserChatStore(rootDirectory: root).mergeAXFirst(uid: canonical, messages: history)
+        let one = try capture(canonical, [old])
+        let two = try capture(alias, [newest])
+        let duplicate = try capture(canonical, [old, answered, newest])
+        let receipts = CustomerMessageReceipts(root: root)
+        for item in [one, two, duplicate] { try receipts.capture(item) }
+        try receipts.replied(capture(canonical, [answered]))
+        var healthy = job(uid: "GZC-10", boundary: "healthy", state: .ready); healthy.sequence = 4
+        var state = AutoReplyPersistentState()
+        state.jobs = [pending(one, 1), pending(two, 2), pending(duplicate, 3, state: .queued), healthy]
+        state.nextSequence = 4; state.answeredCursors[canonical] = cursor
+        try AutoReplyStore(rootDirectory: root).save(state)
+        let driver = SchedulerDriver()
+        let scheduler = try AutoReplyScheduler(driver: driver, generator: Generator(), store: .init(rootDirectory: root))
+        try scheduler.reconcileVisibleIdentity(in: tree("A***", ids: []))
+        let recovered = try XCTUnwrap(scheduler.jobs.last)
+        XCTAssertEqual(recovered.sequence, 5)
+        XCTAssertEqual(recovered.state, .queued)
+        XCTAssertEqual(recovered.uid, canonical)
+        XCTAssertEqual(recovered.capture.batch?.events.map(\.messageID), [old.id, newest.id])
+        XCTAssertEqual(recovered.capture.batch?.startCursor, cursor)
+        XCTAssertEqual(recovered.capture.batch?.endCursor, timeline.cursor)
+        XCTAssertEqual(Array(scheduler.jobs.prefix(3)).map(\.state), [.failed, .failed, .failed])
+        XCTAssertTrue(driver.sentUIDs.isEmpty)
+        XCTAssertNil(try receipts.receipts(uid: canonical)[old.id]?.replySentAt)
+        XCTAssertNil(try receipts.receipts(uid: canonical)[newest.id]?.replySentAt)
+        XCTAssertNil(try receipts.receipts(uid: alias)[newest.id]?.replySentAt)
+        XCTAssertNotNil(try receipts.receipts(uid: alias)[newest.id]?.closedAt)
+        let generator = RecordingGenerator()
+        let restarted = try AutoReplyScheduler(driver: driver, generator: generator, store: .init(rootDirectory: root))
+        restarted.start()
+        for _ in 0..<16 { await restarted.tick(); try await Task.sleep(for: .milliseconds(2)) }
+        restarted.stop()
+        XCTAssertEqual(driver.sentUIDs.filter { $0 == canonical }.count, 1)
+        XCTAssertEqual(driver.sentUIDs.filter { $0 == "GZC-10" }.count, 1)
+        XCTAssertFalse(driver.sentUIDs.contains(alias))
+        XCTAssertFalse(driver.sentTexts.contains("stale reply"))
+        let generated = await generator.recorded()
+        XCTAssertEqual(generated.map { $0.batch?.events.map(\.messageID) }, [[old.id, newest.id]])
+    }
+
+    func testAliasRecoveryRebuildsKnownUnsentTargetWhenNoNewMessagesFollowCursor() throws {
+        let root = temporary(); defer { try? FileManager.default.removeItem(at: root) }
+        let canonical = PDDConversationKey.make(locator: .init(nickname: "A***"))
+        let alias = PDDConversationKey.make(locator: .init(nickname: "A**"))
+        let old = message("old", "hello")
+        let context = message("context", "earlier context")
+        let latest = message("latest", "new question")
+        let history = [old, context, latest]
+        let timeline = try AutoReplyTimeline.make(messages: history)
+        let registry = PDDConversationIdentityStore(root: root)
+        try registry.remember(uid: canonical, messageIDs: [old.id, context.id], stableID: nil, boundary: nil)
+        try registry.remember(uid: alias, messageIDs: [latest.id], stableID: nil, boundary: nil)
+        _ = try registry.reconcileVerifiedThread(messageIDs: [old.id, latest.id], stableID: nil, boundary: nil)
+        _ = try PerUserChatStore(rootDirectory: root).mergeAXFirst(uid: canonical, messages: history)
+        let target = try AutoReplyTimeline.make(messages: [latest])
+        let capture = AutoReplyCapture(uid: alias, fullHistory: history, batch: try target.freeze(after: .empty),
+            customerCursor: timeline.cursor, unexpectedServiceMessageIDs: [])
+        let pending = AutoReplyJob(id: UUID(), uid: alias, sequence: 1, state: .ready, capture: capture,
+            reply: "stale", deliveryOutcome: .notSent, confirmedServiceMessageID: nil, retries: 0, nextAttemptAt: nil, lastError: nil)
+        let recovered = try XCTUnwrap(PDDConversationIdentityRecovery.currentThreadCapture(canonicalUID: canonical,
+            after: timeline.cursor, jobs: [pending], root: root, covered: [old.id]))
+        XCTAssertEqual(recovered.batch?.events.map(\.messageID), [latest.id])
+        XCTAssertEqual(recovered.batch?.startCursor, timeline.cursor)
+        XCTAssertEqual(recovered.batch?.endCursor, timeline.cursor)
+        let missing = message("unproven", "another customer's message")
+        let missingTimeline = try AutoReplyTimeline.make(messages: [missing])
+        var unsafe = pending
+        unsafe.capture = .init(uid: alias, fullHistory: [missing], batch: try missingTimeline.freeze(after: .empty),
+            customerCursor: missingTimeline.cursor, unexpectedServiceMessageIDs: [])
+        XCTAssertNil(try PDDConversationIdentityRecovery.currentThreadCapture(canonicalUID: canonical,
+            after: timeline.cursor, jobs: [unsafe], root: root))
+        XCTAssertNil(try PDDConversationIdentityRecovery.currentThreadCapture(canonicalUID: canonical,
+            after: .init(count: timeline.cursor.count, digest: "wrong"), jobs: [pending], root: root))
+    }
+
+    func testAliasRecoveryDoesNotReplayPreCursorTargetWithUncertainDeliveryOrCommitIntent() async throws {
+        for checkpointOnly in [false, true] {
+            let root = temporary(); defer { try? FileManager.default.removeItem(at: root) }
+            let canonical = PDDConversationKey.make(locator: .init(nickname: "A***"))
+            let alias = PDDConversationKey.make(locator: .init(nickname: "A**"))
+            let history = [message("old", "hello"), message("context", "earlier context"), message("new", "hello today")]
+            let timeline = try AutoReplyTimeline.make(messages: history)
+            let cursor = try XCTUnwrap(timeline.prefixCursor(at: 2))
+            let registry = PDDConversationIdentityStore(root: root)
+            try registry.remember(uid: canonical, messageIDs: ["old", "context"], stableID: nil, boundary: nil)
+            try registry.remember(uid: alias, messageIDs: ["new"], stableID: nil, boundary: nil)
+            _ = try registry.reconcileVerifiedThread(messageIDs: ["old", "new"], stableID: nil, boundary: nil)
+            _ = try PerUserChatStore(rootDirectory: root).mergeAXFirst(uid: canonical, messages: history)
+            let oldTimeline = try AutoReplyTimeline.make(messages: [history[0]])
+            let prior = AutoReplyCapture(uid: canonical, fullHistory: [history[0]], batch: try oldTimeline.freeze(after: .empty),
+                customerCursor: oldTimeline.cursor, unexpectedServiceMessageIDs: [])
+            let targetTimeline = try AutoReplyTimeline.make(messages: [history[0], history[2]])
+            let target = AutoReplyCapture(uid: alias, fullHistory: history, batch: try targetTimeline.freeze(after: .empty),
+                customerCursor: targetTimeline.cursor, unexpectedServiceMessageIDs: [])
+            var uncertain = AutoReplyJob(id: UUID(), uid: canonical, sequence: 1,
+                state: checkpointOnly ? .failed : .completed, capture: prior, reply: "possibly sent",
+                deliveryOutcome: checkpointOnly ? .notSent : .uncertain, confirmedServiceMessageID: nil,
+                retries: 0, nextAttemptAt: nil, lastError: nil)
+            uncertain.sendWasInvoked = !checkpointOnly
+            if checkpointOnly {
+                try PDDTextDeliveryAttemptStore(root: root).save(.init(uid: canonical,
+                    replySHA256: PDDTextDeliveryAttempt.hash("possibly sent"), stage: .commitIntent, updatedAt: Date()), id: uncertain.id)
+            }
+            let pending = AutoReplyJob(id: UUID(), uid: alias, sequence: 2, state: .ready, capture: target,
+                reply: "stale", deliveryOutcome: .notSent, confirmedServiceMessageID: nil,
+                retries: 0, nextAttemptAt: nil, lastError: nil)
+            var healthy = job(uid: "GZC-10", boundary: "healthy", state: .ready); healthy.sequence = 3
+            var state = AutoReplyPersistentState()
+            state.jobs = [uncertain, pending, healthy]; state.nextSequence = 3; state.answeredCursors[canonical] = cursor
+            let store = AutoReplyStore(rootDirectory: root)
+            try store.save(state)
+            let receipts = CustomerMessageReceipts(root: root)
+            try receipts.capture(prior); try receipts.capture(target)
+            let driver = SchedulerDriver(); let generator = RecordingGenerator()
+            let scheduler = try AutoReplyScheduler(driver: driver, generator: generator, store: store)
+            try scheduler.reconcileVisibleIdentity(in: tree("A***", ids: []))
+            XCTAssertEqual(scheduler.jobs.count, 3)
+            XCTAssertEqual(scheduler.jobs[0], uncertain)
+            XCTAssertEqual(scheduler.jobs[1], pending)
+            let restarted = try AutoReplyScheduler(driver: driver, generator: generator, store: store)
+            restarted.start()
+            for _ in 0..<12 { await restarted.tick(); try await Task.sleep(for: .milliseconds(2)) }
+            restarted.stop()
+            XCTAssertEqual(driver.sentUIDs, ["GZC-10"])
+            let generated = await generator.recorded(); XCTAssertTrue(generated.isEmpty)
+            XCTAssertNil(try receipts.receipts(uid: canonical)["old"]?.replySentAt)
+            XCTAssertNil(try receipts.receipts(uid: alias)["new"]?.replySentAt)
+        }
     }
 
     func testAliasRecoveryWaitsForFreshProofHistoryWhileHealthyJobStillSends() async throws {

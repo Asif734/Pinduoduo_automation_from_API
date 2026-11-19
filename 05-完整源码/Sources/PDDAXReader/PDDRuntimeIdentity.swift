@@ -40,7 +40,7 @@ struct PDDRuntimeIdentity: Equatable, Sendable {
                 "Library/Application Support/PDDAutoReplyShared/session.lock"
             ),
             legacySessionLockURL: legacyRoot.appendingPathComponent("session.lock"),
-            startsAutomatically: true
+            startsAutomatically: false
         )
     }
 

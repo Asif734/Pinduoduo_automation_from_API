@@ -157,7 +157,7 @@ private struct AutoReplyProgressPanelView: View {
                         .frame(width: 8, height: 8)
                     BilingualProgressText(BilingualText.lines("全链路进度", "End-to-end progress")).font(.headline)
                     Spacer()
-                    BilingualProgressText(BilingualText.lines("Codex 任务 \(model.liveGenerationCount)", "Codex tasks \(model.liveGenerationCount)"))
+                    BilingualProgressText(BilingualText.lines("API 生成任务 \(model.liveGenerationCount)", "API generation tasks \(model.liveGenerationCount)"))
                         .font(.caption.monospacedDigit())
                 }
 
@@ -197,7 +197,7 @@ private struct AutoReplyProgressPanelView: View {
                     Group {
                         LazyVStack(alignment: .leading, spacing: 8) {
                             ForEach(displayedJobs) { job in
-                                AutoReplyProgressJobCard(job: job)
+                                AutoReplyProgressJobCard(model: model, job: job)
                             }
                             if displayedJobs.isEmpty {
                                 BilingualProgressText(model.isRunning
@@ -257,6 +257,7 @@ private struct BilingualProgressText: View {
 }
 
 private struct AutoReplyProgressJobCard: View {
+    @ObservedObject var model: AutoReplyViewModel
     let job: AutoReplyJob
 
     var body: some View {
@@ -265,9 +266,10 @@ private struct AutoReplyProgressJobCard: View {
                 HStack {
                     Text(job.uid).font(.subheadline.bold())
                     Spacer()
+                    AutoReplyJobDeleteButton(model: model, job: job)
                     Text("#\(job.sequence)").font(.caption.monospacedDigit())
                 }
-                BilingualProgressText(AutoReplyProgressPresentation.jobStageName(job))
+                BilingualProgressText(AutoReplyProgressPresentation.jobStageName(job, jobs: model.jobs))
                     .font(.caption).foregroundStyle(color)
                 if let error = job.lastError {
                     BilingualProgressText(BilingualText.lines("错误：\(error)", "Error: \(error)")).font(.system(size: 10)).foregroundStyle(.orange)

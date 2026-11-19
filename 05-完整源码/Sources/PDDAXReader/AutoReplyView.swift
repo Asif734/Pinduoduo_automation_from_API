@@ -84,8 +84,8 @@ struct AutoReplyView: View {
             }
 
                 Text(BilingualText.lines(
-                    "范围：红点或新消息触发 · AX 读取 · 发送后复查 · 逐条核对 Codex 提交",
-                    "Scope: unread or new-message trigger · AX capture · post-send checks · per-message Codex receipts"
+                    "范围：红点或新消息触发 · AX 读取 · 托管 API 生成 · 发送后复查",
+                    "Scope: unread or new-message trigger · AX capture · hosted API generation · post-send checks"
                 ))
                     .foregroundStyle(.secondary)
                     .font(.caption)
@@ -138,8 +138,8 @@ struct AutoReplyView: View {
                             ))
                         }
                     }
-                    Text(BilingualText.lines("Codex：\(model.codexExecutablePath ?? "不可用")", "Codex: \(model.codexExecutablePath ?? "Unavailable")"))
-                    Text(BilingualText.lines("模型：\(CodexInvocation.model) · \(CodexInvocation.reasoningEffort) · 每位用户独立 session", "Model: \(CodexInvocation.model) · \(CodexInvocation.reasoningEffort) · separate session for each user"))
+                    Text(BilingualText.lines("托管 API：\(model.codexExecutablePath ?? "不可用")", "Hosted API: \(model.codexExecutablePath ?? "Unavailable")"))
+                    Text(BilingualText.lines("范围：pinduoduo-default · 服务端管理客户历史与生成会话", "Scope: pinduoduo-default · server-managed customer history and generation sessions"))
                     if let diagnostic = model.latestKnowledgeDiagnostic {
                         let summary = BilingualText.split(AutoReplyProgressPresentation.knowledgeSummary(diagnostic))
                         Text(BilingualText.lines("知识：\(summary.chinese)", "Knowledge: \(summary.english)"))
@@ -147,11 +147,11 @@ struct AutoReplyView: View {
                             Text(BilingualText.lines("知识库 SHA-256：\(sha)", "Knowledge-base SHA-256: \(sha)"))
                         }
                     } else {
-                        Text(BilingualText.lines("知识：Codex 直接只读阅读本地数据库", "Knowledge: Codex reads the local database directly"))
+                        Text(BilingualText.lines("知识：由托管服务器的已批准拼多多知识库提供", "Knowledge: supplied by the hosted server's approved Pinduoduo library"))
                     }
                     if let snapshot = model.latestResourceSnapshot {
                         let memory = ByteCountFormatter.string(fromByteCount: Int64(clamping: snapshot.availableMemoryBytes), countStyle: .memory)
-                        Text(BilingualText.lines("资源：可用内存 \(memory) · 队列 \(snapshot.queueDepth) · CLI \(snapshot.activeCLI)", "Resources: available memory \(memory) · queue \(snapshot.queueDepth) · CLI \(snapshot.activeCLI)"))
+                        Text(BilingualText.lines("资源：可用内存 \(memory) · 队列 \(snapshot.queueDepth) · 生成任务 \(snapshot.activeCLI)", "Resources: available memory \(memory) · queue \(snapshot.queueDepth) · generation tasks \(snapshot.activeCLI)"))
                     }
                     if let issue = model.lastRuntimeIssue {
                         Text(BilingualText.lines("最近警告（会继续运行）：\(issue)", "Latest warning (operation continues): \(issue)")).foregroundStyle(.orange)
@@ -203,10 +203,11 @@ struct AutoReplyView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
                         Text(job.uid).font(.headline)
-                        Text(AutoReplyProgressPresentation.jobStageName(job)).font(.caption).foregroundStyle(
+                        Text(AutoReplyProgressPresentation.jobStageName(job, jobs: model.jobs)).font(.caption).foregroundStyle(
                             job.state == .uncertain || job.deliveryOutcome == .uncertain ? .orange : .secondary
                         )
                         Spacer()
+                        AutoReplyJobDeleteButton(model: model, job: job)
                         Text("#\(job.sequence)").font(.caption.monospacedDigit())
                     }
                     Text(BilingualText.lines("客户游标：\(job.capture.customerCursor.count) · \(job.capture.customerCursor.digest.prefix(12))", "Customer cursor: \(job.capture.customerCursor.count) · \(job.capture.customerCursor.digest.prefix(12))"))

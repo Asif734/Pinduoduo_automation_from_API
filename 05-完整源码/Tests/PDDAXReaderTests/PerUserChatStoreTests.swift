@@ -2,6 +2,30 @@ import XCTest
 @testable import PDDAXReader
 
 final class PerUserChatStoreTests: XCTestCase {
+    func testAXFirstHistoryPreservesFractionalCaptureTimeAndLoadsLegacyWholeSeconds() throws {
+        let root = temporaryRoot("fractional-time")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = PerUserChatStore(rootDirectory: root)
+        let uid = "PDD-NAME-000000000000000000000000"
+        let capturedAt = Date(timeIntervalSince1970: 1_794_631_389.480)
+        let original = PDDChatMessage(
+            id: "middlePanel_list_fractional", sender: .service, content: "reply",
+            displayTime: nil, kind: .text, capturedAt: capturedAt
+        )
+
+        _ = try store.mergeAXFirst(uid: uid, messages: [original])
+
+        let historyURL = root.appendingPathComponent("用户/\(uid)/history-ax-first.jsonl")
+        let persisted = try String(contentsOf: historyURL, encoding: .utf8)
+        XCTAssertTrue(persisted.contains(".480Z"))
+        let restored = try XCTUnwrap(try store.loadAXFirst(uid: uid).first)
+        XCTAssertEqual(PinduoduoV2DateCodec.string(restored.capturedAt), "2026-11-14T04:43:09.480Z")
+
+        let legacy = persisted.replacingOccurrences(of: ".480Z", with: "Z")
+        try Data(legacy.utf8).write(to: historyURL, options: .atomic)
+        XCTAssertEqual(try store.loadAXFirst(uid: uid).count, 1)
+    }
+
     func testAXFirstHistoryStartsEmptyWithoutTouchingPollutedLegacyHistory() throws {
         let root = temporaryRoot("ax-first-isolation")
         defer { try? FileManager.default.removeItem(at: root) }

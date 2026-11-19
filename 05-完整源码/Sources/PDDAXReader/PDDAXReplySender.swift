@@ -158,6 +158,9 @@ final class PDDAXReplySender {
             if case .failedBeforeSend(let reason) = result {
                 return .failedBeforeSend("图片已确认；文字待重试：\(reason)")
             }
+            if case .wordingRejected = result {
+                return .uncertain("图片已确认；拼多多拒绝文字用语，需检查草稿")
+            }
             return result
         } catch {
             AutomationStepLog.record(root: logRoot, uid: uid, step: "reply-image-error", detail: error.localizedDescription)
@@ -227,9 +230,15 @@ final class PDDAXReplySender {
         let reply = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !reply.isEmpty else { return .failedBeforeSend("回复为空") }
         let attempts = logRoot.map { PDDTextDeliveryAttemptStore(root: $0) }
-        if let deliveryID, let attempts, let previous = try attempts.load(deliveryID), previous.mayHaveSent {
-            return try await reconcileTextDelivery(uid: uid, text: reply, deliveryID: deliveryID,
-                expectedCustomerMessageIDs: expectedCustomerMessageIDs)
+        if let deliveryID, let attempts, let previous = try attempts.load(deliveryID) {
+            if previous.mayHaveSent {
+                return try await reconcileTextDelivery(uid: uid, text: reply, deliveryID: deliveryID,
+                    expectedCustomerMessageIDs: expectedCustomerMessageIDs)
+            }
+            if previous.stage == .wordingRejected, previous.uid == uid,
+               previous.replySHA256 == PDDTextDeliveryAttempt.hash(reply) {
+                return .wordingRejected
+            }
         }
         let handoffKey = expectedCustomerMessageIDs.first {
             $0.hasPrefix(FrozenCustomerBatch.incomingHandoffPrefix)
@@ -307,17 +316,21 @@ final class PDDAXReplySender {
         AutomationStepLog.record(root: logRoot, uid: uid, step: "reply-composer-verified")
         do { try observeSnapshot?(uid, beforePress.rootSnapshot) }
         catch { return .failedBeforeSend("保存客户消息失败：\(error.localizedDescription)") }
+        let initialWarnings = wordingWarnings(in: initialTree.rootSnapshot)
+        let beforePressWarnings = wordingWarnings(in: beforePress.rootSnapshot)
+        if !beforePressWarnings.subtracting(initialWarnings).isEmpty { return .wordingRejected }
         let sendControl: AXElementToken
         do { sendControl = try PDDAXControlSelection.sendControl(in: beforePress.nodes) }
         catch { return .failedBeforeSend(error.localizedDescription) }
 
         try Task.checkCancellation()
         try PDDUIOperationContext.lease?.validate()
+        let baselineServiceIDs = Set([initialTree, afterWrite, beforePress].flatMap { tree in
+            PDDChatParser.parse(root: tree.rootSnapshot).messages.filter { $0.sender == .service }.map(\.id)
+        })
         if let deliveryID, let attempts {
-            let baseline = Set(PDDChatParser.parse(root: initialTree.rootSnapshot).messages
-                .filter { $0.sender == .service }.map(\.id))
             var attempt = PDDTextDeliveryAttempt(uid: uid, replySHA256: PDDTextDeliveryAttempt.hash(reply),
-                stage: .composerVerified, baselineServiceIDs: baseline, updatedAt: Date())
+                stage: .composerVerified, baselineServiceIDs: baselineServiceIDs, updatedAt: Date())
             try attempts.save(attempt, id: deliveryID)
             // Persist BEFORE the action. Anything after this point is observe-only on retry.
             attempt.stage = .commitIntent
@@ -335,15 +348,28 @@ final class PDDAXReplySender {
                     do { try observeSnapshot?(uid, confirmation.rootSnapshot) }
                     catch { return .uncertain("已发送，但保存最新客户消息失败：\(error.localizedDescription)") }
                 }
+                let candidates = PDDChatParser.parse(root: confirmation.rootSnapshot).messages.filter {
+                    matchesServiceReply($0, text: reply, excluding: baselineServiceIDs)
+                }
                 if matches(uid: uid, tree: confirmation, expectedIDs: realMessageIDs),
-                   let composer = try? PDDAXControlSelection.composer(in: confirmation.nodes),
-                   (try? backend.value(of: composer))?.isEmpty == true {
-                    let id = stableSendID(uid: uid, reply: reply, cursor: expectedCustomerCursor, handoffKey: handoffKey)
+                   candidates.count == 1, let posted = candidates.first {
                     if let deliveryID, let attempts, var attempt = try attempts.load(deliveryID) {
-                        attempt.stage = .confirmed; attempt.confirmedMessageID = id; attempt.updatedAt = Date()
+                        attempt.stage = .confirmed; attempt.confirmedMessageID = posted.id; attempt.updatedAt = Date()
                         try attempts.save(attempt, id: deliveryID)
                     }
-                    return .sent(serviceMessageID: id)
+                    return .sent(serviceMessageID: posted.id)
+                }
+                if candidates.isEmpty,
+                   matches(uid: uid, tree: confirmation, expectedIDs: realMessageIDs),
+                   !wordingWarnings(in: confirmation.rootSnapshot).subtracting(beforePressWarnings).isEmpty,
+                   let composer = try? PDDAXControlSelection.composer(in: confirmation.nodes),
+                   (try? backend.value(of: composer)) == reply {
+                    if let deliveryID, let attempts, var attempt = try attempts.load(deliveryID) {
+                        attempt.stage = .wordingRejected
+                        attempt.updatedAt = Date()
+                        try attempts.save(attempt, id: deliveryID)
+                    }
+                    return .wordingRejected
                 }
             } catch {
                 // The send click already happened. Continue bounded read-only observation.
@@ -355,21 +381,51 @@ final class PDDAXReplySender {
                 await Task.yield()
             }
         } while true
-        return .uncertain("发送后输入框未清空，发送结果待后续会话核对")
+        return .uncertain("发送后尚未观察到可唯一绑定的新客服消息，发送结果待后续会话核对")
     }
 
     func reconcileTextDelivery(uid: String, text: String, deliveryID: UUID,
                                expectedCustomerMessageIDs: Set<String>) async throws -> AutoReplyDeliveryResult {
-        guard let logRoot, var attempt = try PDDTextDeliveryAttemptStore(root: logRoot).load(deliveryID),
+        guard let logRoot else { return .uncertain("缺少发送凭据目录；不自动重发") }
+        let attempts = PDDTextDeliveryAttemptStore(root: logRoot)
+        guard var attempt = try attempts.load(deliveryID),
               attempt.uid == uid, attempt.replySHA256 == PDDTextDeliveryAttempt.hash(text) else {
             return .uncertain("缺少匹配的发送凭据；不自动重发")
         }
         if attempt.stage == .confirmed, let id = attempt.confirmedMessageID { return .sent(serviceMessageID: id) }
         guard attempt.mayHaveSent else { return .failedBeforeSend("发送动作尚未执行") }
+        // A proven alias changes which evidence we observe. Reconciliation
+        // must not change the selected conversation or the send binding.
+        let canonicalUID = try PDDConversationIdentityStore(root: logRoot).canonicalUID(uid)
         let realIDs = expectedCustomerMessageIDs.filter { !$0.hasPrefix(FrozenCustomerBatch.incomingHandoffPrefix) }
-        let tree = try await opener.openAndResolve(uid: uid, expectedCustomerMessageIDs: realIDs)
-        guard matches(uid: uid, tree: tree, expectedIDs: realIDs) else { return .uncertain("发送核对时客户身份尚未确认") }
-        try observeSnapshot?(uid, tree.rootSnapshot)
+        try Task.checkCancellation()
+        try PDDUIOperationContext.lease?.validate()
+        if let history = try? PerUserChatStore(rootDirectory: logRoot).loadAXFirst(uid: canonicalUID),
+           let target = history.lastIndex(where: { $0.sender == .customer && realIDs.contains($0.id) }) {
+            // Previously verified AX observations can outlive the rendered
+            // pane. Require exact target, text, and a platform message time
+            // inside the commit window before relying on that history.
+            let candidates = history.dropFirst(target + 1).filter { message in
+                matchesServiceReply(message, text: text, excluding: attempt.baselineServiceIDs)
+                    && isInCommitWindow(message.id, attempt: attempt) == true
+            }
+            if candidates.count > 1 { return .uncertain("历史中有多条匹配回复；待核对，不自动重发") }
+            if let posted = candidates.first {
+                guard try !attempts.isConfirmedByAnotherAttempt(posted.id, excluding: deliveryID) else {
+                    return .uncertain("匹配回复已用于另一条发送凭据；不自动重发")
+                }
+                attempt.stage = .confirmed; attempt.confirmedMessageID = posted.id; attempt.updatedAt = Date()
+                try attempts.save(attempt, id: deliveryID)
+                AutomationStepLog.record(root: logRoot, uid: canonicalUID, step: "reply-delivery-verified-from-ax-history",
+                    detail: "job=\(deliveryID); exact target and reply inside commit window")
+                return .sent(serviceMessageID: posted.id)
+            }
+        }
+        let tree = try backend.readSemanticTreeForObservation()
+        guard matches(uid: canonicalUID, tree: tree, expectedIDs: realIDs) else {
+            return .uncertain("等待打开对应客户会话后核对，不主动切换会话")
+        }
+        try observeSnapshot?(canonicalUID, tree.rootSnapshot)
         let messages = PDDChatParser.parse(root: tree.rootSnapshot).messages
         let lastTarget = messages.lastIndex { realIDs.contains($0.id) && $0.sender == .customer }
         let handoff = expectedCustomerMessageIDs.first { $0.hasPrefix(FrozenCustomerBatch.incomingHandoffPrefix) }
@@ -383,16 +439,58 @@ final class PDDAXReplySender {
         } else {
             return .uncertain("目标消息尚未出现在核对视图；不根据旧同文回复推断送达")
         }
-        if let posted = messages.first(where: {
-            $0.sender == .service && $0.kind == .text && $0.id.hasPrefix("middlePanel_list_")
-                && eligibleServiceIDs.contains($0.id) && !attempt.baselineServiceIDs.contains($0.id)
-                && PDDOCRNormalizer.normalize($0.content) == PDDOCRNormalizer.normalize(text)
-        }) {
+        let candidates = messages.filter {
+            $0.id.hasPrefix("middlePanel_list_") && eligibleServiceIDs.contains($0.id)
+                && matchesServiceReply($0, text: text, excluding: attempt.baselineServiceIDs)
+                && isInCommitWindow($0.id, attempt: attempt) != false
+        }
+        if candidates.count == 1, let posted = candidates.first,
+           try !attempts.isConfirmedByAnotherAttempt(posted.id, excluding: deliveryID) {
             attempt.stage = .confirmed; attempt.confirmedMessageID = posted.id; attempt.updatedAt = Date()
-            try PDDTextDeliveryAttemptStore(root: logRoot).save(attempt, id: deliveryID)
+            try attempts.save(attempt, id: deliveryID)
             return .sent(serviceMessageID: posted.id)
         }
         return .uncertain("尚未找到本次回复的发送证据；保留核对，不自动重发")
+    }
+
+    private func matchesServiceReply(_ message: PDDChatMessage, text: String, excluding baseline: Set<String>) -> Bool {
+        message.sender == .service && [.text, .link].contains(message.kind) && !baseline.contains(message.id)
+            && PDDOCRNormalizer.normalize(message.content) == PDDOCRNormalizer.normalize(text)
+    }
+
+    private func wordingWarnings(in root: AXNodeSnapshot) -> Set<String> {
+        var stack = [root]
+        var warnings = Set<String>()
+        while let node = stack.popLast() {
+            // Never use a chat message, draft value, or highlighted text alone
+            // as evidence that the platform rejected a send.
+            guard !node.domClasses.contains("onemsg") else { continue }
+            if node.role == "AXAlert" || !node.domClasses.isDisjoint(with: ["el-message", "send-warning", "wording-warning"]) {
+                var notification = [node]
+                var text: [String] = []
+                while let item = notification.popLast() {
+                    text.append(contentsOf: ["AXValue", "AXTitle", "AXDescription"].compactMap(item.attribute(named:)))
+                    notification.append(contentsOf: item.children.reversed())
+                }
+                let normalized = PDDOCRNormalizer.normalize(text.joined(separator: " "))
+                if ["敏感词", "违禁词", "违规词"].contains(where: normalized.contains),
+                   ["无法发送", "不能发送", "禁止发送", "不允许发送", "发送失败", "请修改后发送"].contains(where: normalized.contains) {
+                    warnings.insert(normalized)
+                }
+                continue
+            }
+            stack.append(contentsOf: node.children)
+        }
+        return warnings
+    }
+
+    private func isInCommitWindow(_ id: String, attempt: PDDTextDeliveryAttempt) -> Bool? {
+        let prefix = "middlePanel_list_"
+        guard id.hasPrefix(prefix) else { return nil }
+        let suffix = id.dropFirst(prefix.count)
+        guard suffix.count == 13, let millis = Int64(suffix) else { return nil }
+        let delta = Double(millis) / 1_000 - attempt.updatedAt.timeIntervalSince1970
+        return (0...max(3, confirmationTimeout + 2)).contains(delta)
     }
 
     private func waitForComposerValue(_ expected: String, on composer: AXElementToken) async -> Bool {

@@ -25,6 +25,7 @@ final class PDDAXVideoPreviewOpener: PDDVideoPreviewOpening {
     typealias ConfirmationPause = @MainActor () async throws -> Void
 
     private let backend: any PDDAXBackend
+    private let logRoot: URL?
     private let clickOverride: ClickOverride?
     private let previewProbeOverride: PreviewProbeOverride?
     private let confirmationPause: ConfirmationPause
@@ -35,6 +36,7 @@ final class PDDAXVideoPreviewOpener: PDDVideoPreviewOpening {
 
     init(
         backend: any PDDAXBackend,
+        logRoot: URL? = nil,
         clickOverride: ClickOverride? = nil,
         previewProbeOverride: PreviewProbeOverride? = nil,
         confirmationPause: @escaping ConfirmationPause = {
@@ -42,6 +44,7 @@ final class PDDAXVideoPreviewOpener: PDDVideoPreviewOpening {
         }
     ) {
         self.backend = backend
+        self.logRoot = logRoot
         self.clickOverride = clickOverride
         self.previewProbeOverride = previewProbeOverride
         self.confirmationPause = confirmationPause
@@ -55,6 +58,10 @@ final class PDDAXVideoPreviewOpener: PDDVideoPreviewOpening {
                 in: tree.nodes, messageIDs: [candidate.messageID]
             ).first
         } ?? candidate
+        if let logRoot {
+            AutomationStepLog.record(root: logRoot, uid: lease.uid, step: "video-preview-click-target",
+                detail: "message_id=\(candidate.messageID) frame=\(refreshedCandidate.frame); refreshed=\(refreshedCandidate != candidate)")
+        }
         if let clickOverride {
             try await clickOverride(refreshedCandidate)
         } else {
@@ -62,6 +69,10 @@ final class PDDAXVideoPreviewOpener: PDDVideoPreviewOpening {
         }
         try Task.checkCancellation()
         try lease.validate()
+        if let logRoot {
+            AutomationStepLog.record(root: logRoot, uid: lease.uid, step: "video-preview-click-posted",
+                detail: "message_id=\(candidate.messageID); waiting for matching cache URL")
+        }
     }
 
     func waitUntilOpen() async throws -> Bool {

@@ -19,6 +19,14 @@ enum PDDChatParser {
             switch parseMessage(node, capturedAt: capturedAt) {
             case .success(let message):
                 messages.append(message)
+                if message.sender == .customer, message.kind == .image,
+                   let caption = imageCaption(in: node) {
+                    let digest = SHA256.hash(data: Data("\(message.id)\u{1f}\(caption)".utf8))
+                        .map { String(format: "%02x", $0) }.joined()
+                    messages.append(.init(id: "pdd-image-caption-" + digest,
+                        sender: .customer, content: caption, displayTime: message.displayTime,
+                        kind: .text, capturedAt: capturedAt))
+                }
             case .failure(let reason):
                 let identifier = node.attribute(named: "AXDOMIdentifier") ?? "无消息 ID"
                 diagnostics.append("跳过 \(identifier)：\(reason)")
@@ -72,13 +80,26 @@ enum PDDChatParser {
         } else {
             guard !values.isEmpty else { return .failure("消息正文为空") }
             kind = hasLink ? .link : .text
-            content = values.joined(separator: "\n")
+            let body = values.joined(separator: "\n")
+            let cleaned = PDDMessageBodyText.serviceBodyWithoutReadStatus(body)
+            content = sender == .service && !cleaned.isEmpty ? cleaned : body
         }
 
         let displayTime = firstVisibleValue(inClass: "message-time", node: node)
-        let messageID = node.attribute(named: "AXDOMIdentifier")
-            .flatMap { $0.hasPrefix("middlePanel_list_") ? $0 : nil }
-            ?? fallbackID(sender: sender, kind: kind, time: displayTime, content: content)
+        let rawDOMIdentifier = node.attribute(named: "AXDOMIdentifier")?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let messageID: String
+        if let rawDOMIdentifier, !rawDOMIdentifier.isEmpty {
+            if rawDOMIdentifier.hasPrefix("middlePanel_list_") {
+                messageID = rawDOMIdentifier
+            } else {
+                let digest = SHA256.hash(data: Data(rawDOMIdentifier.utf8))
+                    .map { String(format: "%02x", $0) }.joined()
+                messageID = "pdd-dom-" + digest
+            }
+        } else {
+            messageID = fallbackID(sender: sender, kind: kind, time: displayTime, content: content)
+        }
 
         return .success(PDDChatMessage(
             id: messageID,
@@ -110,6 +131,24 @@ enum PDDChatParser {
         }
         scan(node)
         return hasThumbnail && hasDuration
+    }
+
+    private static func imageCaption(in node: AXNodeSnapshot) -> String? {
+        var roots: [AXNodeSnapshot] = []
+        collectContentRoots(in: node, into: &roots)
+        var values: [String] = []
+        func visit(_ current: AXNodeSnapshot) {
+            guard current.role != "AXImage", current.role != "AXButton",
+                  current.domClasses.isDisjoint(with: ["read-status", "message-status", "msg-read-status"]) else { return }
+            if current.role == "AXStaticText" {
+                let text = normalize(current.attribute(named: "AXValue") ?? current.attribute(named: "AXTitle") ?? "")
+                if !text.isEmpty && text != "[图片]" { values.append(text) }
+            }
+            for child in current.children { visit(child) }
+        }
+        roots.forEach(visit)
+        let caption = orderedUnique(values).joined(separator: "\n")
+        return caption.isEmpty ? nil : caption
     }
 
     private static func containsExplicitVideo(in node: AXNodeSnapshot) -> Bool {

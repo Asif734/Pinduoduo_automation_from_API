@@ -3,6 +3,114 @@ import XCTest
 
 @MainActor
 final class AutoReplySchedulerTests: XCTestCase {
+    func testHostedGenerationFailureHandsOffWithoutFakingAnAnswer() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let uid = "GZC-000123"
+        let driver = ControlledAutoReplyDriver(capturesByUID: [uid: [["question"]]])
+        driver.discoveries = [.init(uid: uid, hasUnreadEvidence: true)]
+        let generator = AlwaysFailingCodexGenerator(error: PinduoduoV2ClientError.jobFailed(code: "CODEX_FAILED", message: "worker failed"))
+        let store = AutoReplyStore(rootDirectory: root)
+        let scheduler = try AutoReplyScheduler(driver: driver, generator: generator, store: store,
+            configuredMaximumConcurrentGenerations: 1, availableMemoryBytes: { 64 << 30 })
+        scheduler.start()
+        defer { scheduler.stop() }
+        for _ in 0..<60 {
+            await scheduler.tick()
+            if try store.load().transferTasks.first?.state == .completed { break }
+            try await Task.sleep(for: .milliseconds(3))
+        }
+        let state = try store.load()
+        XCTAssertEqual(driver.transferredUIDs, [uid])
+        XCTAssertTrue(driver.sentTexts.isEmpty)
+        XCTAssertEqual(state.transferTasks.map(\.state), [.completed])
+        XCTAssertEqual(state.jobs.first?.deliveryOutcome, .notSent)
+        XCTAssertEqual(state.answeredCursors[uid] ?? .empty, .empty)
+    }
+
+    func testRestartQueuesOnlyLatestUnansweredHostedFailureForHandoff() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let uid = "GZC-000123"
+        let store = AutoReplyStore(rootDirectory: root)
+        let outbox = PinduoduoV2GenerationOutboxStore(rootDirectory: root)
+        var state = AutoReplyPersistentState.empty
+        for sequence in 1...2 {
+            let capture = try makeFrozenCapture(uid: uid, ids: Array(["first", "second"].prefix(sequence)), after: .empty)
+            let job = AutoReplyJob(id: UUID(), uid: uid, sequence: sequence, state: .quarantined,
+                capture: capture, reply: nil, deliveryOutcome: .notSent, confirmedServiceMessageID: nil,
+                retries: 1, nextAttemptAt: nil, lastError: "CODEX_FAILED")
+            var record = try PinduoduoV2RequestBuilder(rootDirectory: root).freeze(localJobID: job.id, capture: capture)
+            record.phase = .failed
+            record.hostedJobID = "hosted-\(sequence)"
+            record.lastErrorCode = "CODEX_FAILED"
+            try outbox.save(record)
+            state.jobs.append(job)
+        }
+        try store.save(state)
+        let driver = ControlledAutoReplyDriver(capturesByUID: [:])
+        for _ in 0..<2 {
+            _ = try AutoReplyScheduler(driver: driver, generator: ControlledReplyGenerator(delayNanoseconds: 0), store: store)
+            let persisted = try store.load()
+            XCTAssertEqual(persisted.transferTasks.map(\.sourceJobID), [state.jobs[1].id])
+            XCTAssertEqual(persisted.transferTasks.map(\.state), [.pending])
+        }
+        var interrupted = try store.load()
+        interrupted.transferTasks[0].hostedHandoffStartedAt = Date()
+        try store.save(interrupted)
+        _ = try AutoReplyScheduler(driver: driver, generator: ControlledReplyGenerator(delayNanoseconds: 0), store: store)
+        let recovered = try store.load()
+        XCTAssertEqual(recovered.transferTasks.map(\.id), interrupted.transferTasks.map(\.id))
+        XCTAssertEqual(recovered.transferTasks.map(\.state), [.failed])
+        XCTAssertTrue(recovered.events.contains { $0.kind == "transfer-verification-required" })
+        XCTAssertTrue(driver.transferredUIDs.isEmpty)
+    }
+
+    func testHostedTerminalFailureIsNotSilentlySkippedOnRestart() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let capture = try makeFrozenCapture(uid: "customer", ids: ["question"], after: .empty)
+        let job = AutoReplyJob(id: UUID(), uid: "customer", sequence: 1, state: .quarantined,
+            capture: capture, reply: nil, deliveryOutcome: .notSent, confirmedServiceMessageID: nil,
+            retries: 1, nextAttemptAt: nil, lastError: "MESSAGE_ID_CONFLICT")
+        var state = AutoReplyPersistentState.empty; state.jobs = [job]; state.nextSequence = 1
+        let store = AutoReplyStore(rootDirectory: root); try store.save(state)
+        let outbox = PinduoduoV2GenerationOutboxStore(rootDirectory: root)
+        var record = try PinduoduoV2RequestBuilder(rootDirectory: root).freeze(localJobID: job.id, capture: capture)
+        record.phase = .failed; record.lastErrorCode = "MESSAGE_ID_CONFLICT"; try outbox.save(record)
+        let scheduler = try AutoReplyScheduler(driver: ControlledAutoReplyDriver(capturesByUID: [:]),
+            generator: ControlledReplyGenerator(delayNanoseconds: 0), store: store)
+        XCTAssertEqual(scheduler.jobs.first?.state, .quarantined)
+        XCTAssertEqual(scheduler.jobs.first?.lastError, "MESSAGE_ID_CONFLICT")
+        XCTAssertEqual(try store.load().answeredCursors["customer"] ?? .empty, .empty)
+        XCTAssertEqual(scheduler.jobs.first?.deliveryOutcome, .notSent)
+    }
+
+    func testSubmissionRecoverySkipsOnlyVerifiedHistoryBehindAnsweredCursor() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let uid = "GZC-000001"
+        let history = try makeFrozenCapture(uid: uid, ids: ["old", "new"], after: .empty)
+        let timeline = try AutoReplyTimeline.make(messages: history.fullHistory)
+        var state = AutoReplyPersistentState.empty
+        state.answeredCursors[uid] = try XCTUnwrap(timeline.prefixCursor(at: 1))
+        let store = AutoReplyStore(rootDirectory: root)
+        try store.save(state)
+        _ = try PerUserChatStore(rootDirectory: root).mergeAXFirst(uid: uid, messages: history.fullHistory)
+        let receipts = CustomerMessageReceipts(root: root)
+        try receipts.capture(history)
+        let scheduler = try AutoReplyScheduler(driver: ControlledAutoReplyDriver(capturesByUID: [:]),
+            generator: ControlledReplyGenerator(delayNanoseconds: 0), store: store)
+        scheduler.start()
+        defer { scheduler.stop() }
+        await scheduler.tick()
+        let saved = try store.load()
+        XCTAssertEqual(saved.pendingCaptureRequests.map(\.uid), [uid])
+        XCTAssertEqual(saved.events.last { $0.kind == "capture-submission-gap-recovered" }?.detail, "message_ids=new")
+        XCTAssertEqual(try receipts.awaitingSubmission()[uid], ["old", "new"],
+            "Cursor filtering must not fabricate submission, closure or delivery")
+    }
+
     func testReadyReplyPrecedesAnotherCustomersTailScan() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -395,7 +503,7 @@ final class AutoReplySchedulerTests: XCTestCase {
         XCTAssertEqual(generator.targetIDs, [["new-hi"]])
     }
 
-    func testRetryEventBeforeCaptureCannotLeaveTheReplyWaitingForTheNextRetry() async throws {
+    func testRetryEventBeforeCaptureKeepsVideoPendingUntilEvidenceArrives() async throws {
         let uid = "PDD-one"
         let f = try SchedulerFixture(capturesByUID: [uid: [["video-1"]]])
         f.driver.pendingVideoMessageIDsByUID[uid] = ["video-1"]
@@ -403,15 +511,55 @@ final class AutoReplySchedulerTests: XCTestCase {
             phase: .waitingForRetry, diagnostic: "previewUnavailable retry_in=180s"))
         f.driver.discoveries = [.init(uid: uid, hasUnreadEvidence: true)]
         await f.runTicks(2)
-        XCTAssertTrue(f.scheduler.pendingVideoBatchesSnapshot.isEmpty)
-        XCTAssertEqual(f.scheduler.jobs.count, 1)
-        XCTAssertEqual(f.scheduler.jobs[0].state, .ready)
-        XCTAssertNotNil(f.scheduler.jobs[0].reply)
+        XCTAssertEqual(f.scheduler.pendingVideoBatchesSnapshot.count, 1)
+        XCTAssertTrue(f.scheduler.jobs.isEmpty)
+        XCTAssertEqual(f.driver.sendCallCount, 0)
+        XCTAssertNil(try CustomerMessageReceipts(root: f.root).receipts(uid: uid)["video-1"]?.replySentAt)
         XCTAssertTrue(try AutoReplyStore(rootDirectory: f.root).load().deferredVideoTransferEvents.isEmpty)
         await f.scheduler.receiveVideoTransferEvent(.init(uid: uid, messageID: "video-1",
             phase: .readyForGeneration, attachment: videoAttachment(messageID: "video-1"), recovered: true))
-        XCTAssertEqual(f.scheduler.jobs.count, 2, "Background analysis must still be admitted when retry succeeds")
-        XCTAssertEqual(f.scheduler.jobs[1].videoAttachments.map(\.messageID), ["video-1"])
+        XCTAssertEqual(f.scheduler.jobs.count, 1)
+        XCTAssertEqual(f.scheduler.jobs[0].videoAttachments.map(\.messageID), ["video-1"])
+    }
+
+    func testRestartStopsRestoredVideoWaitWhenProductQuestionWasAlreadySent() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let uid = "PDD-one"
+        let capture = try makeVideoCapture(uid: uid, messageID: "video-1")
+        let receipts = CustomerMessageReceipts(root: root)
+        try receipts.capture(capture)
+        try receipts.replied(capture)
+        let originalSentAt = try receipts.receipts(uid: uid)["video-1"]?.replySentAt
+        var state = AutoReplyPersistentState.empty
+        state.nextSequence = 1
+        let job = AutoReplyJob(id: UUID(), uid: uid, sequence: 1, state: .failed,
+            capture: capture, reply: PDDVideoFallbackRecovery.reply, deliveryOutcome: .sent,
+            confirmedServiceMessageID: "fallback-service", retries: 0, nextAttemptAt: nil, lastError: nil)
+        state.jobs = [job]
+        state.pendingVideoBatches = [.init(uid: uid, capture: capture, expectedMessageIDs: ["video-1"])]
+        state.answeredCursors[uid] = capture.customerCursor
+        let store = AutoReplyStore(rootDirectory: root)
+        try store.save(state)
+        let transferStore = PDDDurableVideoTransferStore(url: root.appendingPathComponent("videos/transfer-state.json"))
+        let key = PDDVideoTransferKey(uid: uid, messageID: "video-1")
+        _ = try await transferStore.begin(key: key, uid: uid, messageID: "video-1")
+        try await transferStore.scheduleRetry(key: key, category: .previewUnavailable, nextAttemptAt: Date())
+        let driver = ControlledAutoReplyDriver(capturesByUID: [:])
+        let generator = ControlledReplyGenerator(delayNanoseconds: 0)
+        let scheduler = try AutoReplyScheduler(driver: driver, generator: generator, store: store)
+        XCTAssertTrue(scheduler.pendingVideoBatchesSnapshot.isEmpty)
+        XCTAssertEqual(scheduler.jobs[0].state, .completed)
+        XCTAssertEqual(scheduler.jobs[0].deliveryOutcome, .sent)
+        XCTAssertEqual(scheduler.jobs[0].confirmedServiceMessageID, "fallback-service")
+        let repaired = try XCTUnwrap(receipts.receipts(uid: uid)["video-1"])
+        XCTAssertEqual(repaired.replySentAt, originalSentAt)
+        XCTAssertEqual(repaired.videoFallbackSentAt, originalSentAt)
+        XCTAssertEqual(driver.sendCallCount, 0)
+        let restarted = try AutoReplyScheduler(driver: driver, generator: generator, store: store)
+        XCTAssertTrue(restarted.pendingVideoBatchesSnapshot.isEmpty)
+        XCTAssertEqual(restarted.jobs.count, 1)
+        XCTAssertEqual(driver.sendCallCount, 0)
     }
 
     func testConfirmedReplyUnderOldMaskedNameIsNotReplayedForCanonicalCustomer() async throws {
@@ -1805,7 +1953,7 @@ final class AutoReplySchedulerTests: XCTestCase {
         XCTAssertTrue(f.scheduler.jobs[0].videoAttachments.isEmpty)
     }
 
-    func testVideoImmediateFailureCreatesOneFixedReadyReplyAndReleasesBatch() async throws {
+    func testVideoFallbackAdvisoryKeepsBatchPendingUntilTerminalFailure() async throws {
         let uid = "PDD-video-fallback"
         let f = try SchedulerFixture(capturesByUID: [uid: [["video-1"]]])
         f.driver.pendingVideoMessageIDsByUID[uid] = ["video-1"]
@@ -1819,16 +1967,22 @@ final class AutoReplySchedulerTests: XCTestCase {
         await f.scheduler.receiveVideoTransferEvent(event)
         await f.scheduler.receiveVideoTransferEvent(event)
 
+        XCTAssertEqual(f.scheduler.pendingVideoBatchesSnapshot.count, 1)
+        XCTAssertTrue(f.scheduler.jobs.isEmpty)
+        XCTAssertNil(try CustomerMessageReceipts(root: f.root).receipts(uid: uid)["video-1"]?.replySentAt)
+
+        await f.scheduler.receiveVideoTransferEvent(.init(uid: uid, messageID: "video-1", phase: .failed))
+
         XCTAssertTrue(f.scheduler.pendingVideoBatchesSnapshot.isEmpty)
         XCTAssertEqual(f.scheduler.jobs.count, 1)
         XCTAssertEqual(f.scheduler.jobs[0].state, .ready)
         XCTAssertEqual(
             f.scheduler.jobs[0].reply,
-            "视频已收到，您希望我重点帮您查看哪个问题？也可以描述一下具体表现。"
+            CustomerFacingFallback.productProblemQuestion(history: f.scheduler.jobs[0].capture.fullHistory)
         )
     }
 
-    func testLaterRecoveredVideoCreatesIndependentAnalysisJobExactlyOnce() async throws {
+    func testLaterRecoveredVideoResolvesOriginalPendingBatchExactlyOnce() async throws {
         let uid = "PDD-video-recovered"
         let f = try SchedulerFixture(capturesByUID: [uid: [["video-1"]]])
         f.driver.pendingVideoMessageIDsByUID[uid] = ["video-1"]
@@ -1845,9 +1999,9 @@ final class AutoReplySchedulerTests: XCTestCase {
         await f.scheduler.receiveVideoTransferEvent(recovered)
         await f.scheduler.receiveVideoTransferEvent(recovered)
 
-        XCTAssertEqual(f.scheduler.jobs.count, 2)
-        XCTAssertEqual(f.scheduler.jobs[1].state, .queued)
-        XCTAssertEqual(f.scheduler.jobs[1].videoAttachments.map(\.messageID), ["video-1"])
+        XCTAssertEqual(f.scheduler.jobs.count, 1)
+        XCTAssertEqual(f.scheduler.jobs[0].state, .queued)
+        XCTAssertEqual(f.scheduler.jobs[0].videoAttachments.map(\.messageID), ["video-1"])
     }
 
     func testRecoveredResentVideoWithSameBytesGetsOwnJobButRepeatedEventDoesNot() async throws {
@@ -2147,6 +2301,51 @@ final class AutoReplySchedulerTests: XCTestCase {
 
         XCTAssertEqual(scheduler.jobs.map(\.state), [.failed, .queued])
         XCTAssertEqual(scheduler.jobs[1].capture.batch?.events.map(\.messageID), ["B"])
+    }
+
+    func testRestartRecoversEarliestHostedFrozenRequestAndSuppressesDuplicateBatch() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pdd-hosted-frozen-recovery-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let uid = "GZC-000001"
+        let capture = try makeFrozenCapture(uid: uid, ids: ["A"], after: .empty)
+        let first = AutoReplyJob(
+            id: UUID(), uid: uid, sequence: 1, state: .quarantined, capture: capture,
+            reply: nil, deliveryOutcome: .notSent, confirmedServiceMessageID: nil,
+            retries: 1, nextAttemptAt: nil,
+            lastError: "Poll URL escaped the authorized Pinduoduo V2 origin or scope"
+        )
+        let duplicate = AutoReplyJob(
+            id: UUID(), uid: uid, sequence: 2, state: .quarantined, capture: capture,
+            reply: nil, deliveryOutcome: .notSent, confirmedServiceMessageID: nil,
+            retries: 1, nextAttemptAt: nil,
+            lastError: "Poll URL escaped the authorized Pinduoduo V2 origin or scope"
+        )
+        var state = AutoReplyPersistentState.empty
+        state.nextSequence = 2
+        state.jobs = [first, duplicate]
+        let store = AutoReplyStore(rootDirectory: root)
+        try store.save(state)
+        let hosted = PinduoduoV2GenerationOutboxStore(rootDirectory: root)
+        for job in [first, duplicate] {
+            try hosted.save(PinduoduoV2GenerationOutboxRecord(
+                localJobID: job.id, customerUid: uid,
+                historyVersion: "batch-\(job.id.uuidString.lowercased())",
+                idempotencyKey: job.id.uuidString.lowercased(), requestJSON: Data("{}".utf8),
+                files: [], messageFingerprints: [:], mediaFingerprints: [:], createdAt: Date(),
+                phase: .frozen
+            ))
+        }
+
+        let scheduler = try AutoReplyScheduler(
+            driver: ControlledAutoReplyDriver(capturesByUID: [:]),
+            generator: ControlledReplyGenerator(delayNanoseconds: 0), store: store
+        )
+
+        XCTAssertEqual(scheduler.jobs.map(\.state), [.queued, .failed])
+        XCTAssertEqual(scheduler.jobs.first?.id, first.id)
+        XCTAssertTrue(scheduler.jobs[1].lastError?.contains("重复任务不会发送") == true)
+        XCTAssertEqual(try store.load().jobs.map(\.state), [.queued, .failed])
     }
 
     func testTerminalSourceBoundSupplementRequestStillPromotesAfterRestart() async throws {
@@ -2880,6 +3079,36 @@ final class AutoReplySchedulerTests: XCTestCase {
         XCTAssertEqual(f.driver.sendCallCount, 1)
     }
 
+    func testPendingCaptureRunsBeforeIdleDeliveryReconciliation() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let locator = PDDConversationLocator(nickname: "A***")
+        let uid = PDDConversationKey.make(locator: locator)
+        let newUID = "GZC-000002"
+        let capture = try schedulingCapture(uid: uid, ids: ["old"], after: 0)
+        let uncertain = AutoReplyJob(id: UUID(), uid: uid, sequence: 1, state: .completed,
+            capture: capture, reply: "old reply", deliveryOutcome: .uncertain,
+            confirmedServiceMessageID: nil, retries: 0, nextAttemptAt: Date(timeIntervalSince1970: 100),
+            lastError: "delivery unconfirmed")
+        var state = AutoReplyPersistentState.empty
+        state.jobs = [uncertain]; state.nextSequence = 1
+        state.pendingCaptureRequests = [.init(uid: newUID, kind: .ordinary, baseCursor: .empty)]
+        let store = AutoReplyStore(rootDirectory: root)
+        try store.save(state)
+        let driver = ControlledAutoReplyDriver(capturesByUID: [newUID: [["new"]]])
+        driver.supportsTextDeliveryTracking = true
+        driver.visibleLocators = [locator]
+        let scheduler = try AutoReplyScheduler(driver: driver, generator: ActiveDeliveryOrderingGenerator(),
+            store: store, now: { Date(timeIntervalSince1970: 100) })
+        scheduler.start()
+        defer { scheduler.stop() }
+
+        await scheduler.tick()
+
+        XCTAssertEqual(driver.captureCallCount, 1)
+        XCTAssertEqual(driver.reconciliationCalls, 0)
+    }
+
     func testTrackedUncertainDeliveryIsReconciledWithoutAnotherSend() async throws {
         let locator = PDDConversationLocator(nickname: "A***")
         let uid = PDDConversationKey.make(locator: locator)
@@ -2899,6 +3128,98 @@ final class AutoReplySchedulerTests: XCTestCase {
         XCTAssertEqual(f.driver.sendCallCount, 1)
         XCTAssertEqual(f.driver.reconciliationCalls, 1)
         XCTAssertNotNil(try CustomerMessageReceipts(root: f.root).receipts(uid: uid)["A"]?.replySentAt)
+    }
+
+    func testUncertainDeliveryDoesNotBlockLaterGenerationOrSendForSameCustomer() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let uid = "customer"
+        let earlierCapture = try schedulingCapture(uid: uid, ids: ["A"], after: 0)
+        let laterCapture = try schedulingCapture(uid: uid, ids: ["A", "B"], after: 1)
+        let earlier = AutoReplyJob(
+            id: UUID(), uid: uid, sequence: 1, state: .completed, capture: earlierCapture,
+            reply: "possibly sent reply", deliveryOutcome: .uncertain,
+            confirmedServiceMessageID: nil, retries: 0, nextAttemptAt: nil,
+            lastError: "send result requires verification"
+        )
+        let later = AutoReplyJob(
+            id: UUID(), uid: uid, sequence: 2, state: .queued, capture: laterCapture,
+            reply: nil, deliveryOutcome: nil, confirmedServiceMessageID: nil,
+            retries: 0, nextAttemptAt: nil, lastError: nil
+        )
+        var state = AutoReplyPersistentState.empty
+        state.jobs = [earlier, later]
+        state.answeredCursors[uid] = earlierCapture.batch?.endCursor
+        state.nextSequence = 2
+        let store = AutoReplyStore(rootDirectory: root)
+        try store.save(state)
+        let driver = ControlledAutoReplyDriver(capturesByUID: [:])
+        let generator = ActiveDeliveryOrderingGenerator()
+        let scheduler = try AutoReplyScheduler(driver: driver, generator: generator, store: store)
+        scheduler.start()
+        defer { scheduler.stop() }
+
+        for _ in 0..<100 {
+            await scheduler.tick()
+            if scheduler.jobs.first(where: { $0.sequence == 2 })?.state == .completed { break }
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+
+        XCTAssertEqual(generator.captures.count, 1)
+        XCTAssertEqual(generator.captures.first?.batch?.customerMessageIDs, ["B"])
+        XCTAssertTrue(generator.captures.first?.pendingReplyDrafts?.contains {
+            $0.jobID == earlier.id && $0.text == "possibly sent reply"
+        } == true)
+        XCTAssertEqual(scheduler.jobs.first(where: { $0.id == earlier.id })?.deliveryOutcome, .uncertain)
+        XCTAssertEqual(scheduler.jobs.first(where: { $0.id == later.id })?.deliveryOutcome, .sent)
+        XCTAssertEqual(driver.sentTexts, ["reply:B"])
+    }
+
+    func testReconciledHostedDeliveryEnqueuesVerifiedDeliveryEvent() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let locator = PDDConversationLocator(nickname: "A***")
+        let uid = PDDConversationKey.make(locator: locator)
+        let capture = try schedulingCapture(uid: uid, ids: ["A"], after: 0)
+        let receipt = PinduoduoV2GenerationReceipt(
+            jobId: "hosted-job", platform: "pinduoduo", storeId: "pinduoduo-default",
+            customerUid: uid, historyVersion: "history-v1", resultDigest: String(repeating: "a", count: 64)
+        )
+        let uncertain = AutoReplyJob(
+            id: UUID(), uid: uid, sequence: 1, state: .completed, capture: capture,
+            reply: "confirmed reply", deliveryOutcome: .uncertain,
+            confirmedServiceMessageID: nil, retries: 0, nextAttemptAt: Date(timeIntervalSince1970: 100),
+            lastError: "send result requires verification", hostedGeneration: receipt
+        )
+        var state = AutoReplyPersistentState.empty
+        state.jobs = [uncertain]
+        state.nextSequence = 1
+        let store = AutoReplyStore(rootDirectory: root)
+        try store.save(state)
+        let driver = ControlledAutoReplyDriver(capturesByUID: [:])
+        driver.supportsTextDeliveryTracking = true
+        driver.visibleLocators = [locator]
+        driver.reconciliationResults = [.sent(serviceMessageID: "middlePanel_list_confirmed")]
+        let recorder = DeliveryRecorderSpy()
+        let scheduler = try AutoReplyScheduler(
+            driver: driver, generator: ActiveDeliveryOrderingGenerator(),
+            hostedDeliveryRecorder: recorder, store: store,
+            now: { Date(timeIntervalSince1970: 100) }
+        )
+        scheduler.start()
+        defer { scheduler.stop() }
+
+        for _ in 0..<100 {
+            await scheduler.tick()
+            if !recorder.verifiedSends.isEmpty { break }
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+
+        XCTAssertEqual(scheduler.jobs.first?.deliveryOutcome, .sent)
+        XCTAssertEqual(recorder.verifiedSends.count, 1)
+        XCTAssertEqual(recorder.verifiedSends.first?.receipt, receipt)
+        XCTAssertEqual(recorder.verifiedSends.first?.text, "confirmed reply")
+        XCTAssertEqual(recorder.verifiedSends.first?.serviceMessageID, "middlePanel_list_confirmed")
     }
 
     func testTrackedPreSendCancellationRetainsReplyWithoutAdvancingCustomer() async throws {
@@ -3496,6 +3817,11 @@ private func makeVideoCapture(
 
 @MainActor
 private final class ControlledAutoReplyDriver: AutoReplyAutomationDriver {
+    func transferHostedFailure(uid: String, expectedCustomerMessageIDs: Set<String>,
+                               lease: UIOperationLease) async throws -> AutoReplyTransferResult {
+        XCTAssertFalse(expectedCustomerMessageIDs.isEmpty)
+        return try await transferToAnyHuman(uid: uid, lease: lease)
+    }
     var supportsTextDeliveryTracking = false
     var reconciliationResults: [AutoReplyDeliveryResult] = []
     var reconciliationCalls = 0
@@ -3911,4 +4237,56 @@ private final class SchedulingGenerator: AutoReplyGenerating, @unchecked Sendabl
         return .init(reply: "new answer", threadID: "test")
     }
     private func record(_ capture: AutoReplyCapture) { lock.lock(); defer { lock.unlock() }; stored.append(capture) }
+}
+
+private final class ActiveDeliveryOrderingGenerator:
+    AutoReplyGenerating, AutoReplyGenerationPolicyProviding, @unchecked Sendable {
+    let serializesGenerationBehindActiveDelivery = true
+    private let lock = NSLock()
+    private var stored: [AutoReplyCapture] = []
+
+    var captures: [AutoReplyCapture] {
+        lock.lock()
+        defer { lock.unlock() }
+        return stored
+    }
+
+    func generate(_ capture: AutoReplyCapture) async throws -> CodexReplyResult {
+        lock.lock()
+        stored.append(capture)
+        lock.unlock()
+        let targetIDs = capture.batch?.customerMessageIDs.sorted() ?? []
+        return CodexReplyResult(reply: "reply:" + targetIDs.joined(separator: ","), threadID: "test")
+    }
+}
+
+private final class DeliveryRecorderSpy: PinduoduoV2DeliveryRecording, @unchecked Sendable {
+    struct VerifiedSend: Equatable {
+        let receipt: PinduoduoV2GenerationReceipt
+        let text: String
+        let serviceMessageID: String
+        let occurredAt: Date
+    }
+
+    private let lock = NSLock()
+    private var storedVerifiedSends: [VerifiedSend] = []
+
+    var verifiedSends: [VerifiedSend] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedVerifiedSends
+    }
+
+    func enqueueVerifiedSend(receipt: PinduoduoV2GenerationReceipt, actualSentText: String,
+                             serviceMessageID: String, occurredAt: Date) throws {
+        lock.lock()
+        storedVerifiedSends.append(.init(
+            receipt: receipt, text: actualSentText,
+            serviceMessageID: serviceMessageID, occurredAt: occurredAt
+        ))
+        lock.unlock()
+    }
+
+    func enqueueUnknown(receipt: PinduoduoV2GenerationReceipt, occurredAt: Date) throws {}
+    func flushPending() async {}
 }

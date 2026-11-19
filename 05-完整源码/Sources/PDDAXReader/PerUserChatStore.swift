@@ -1,5 +1,47 @@
 import Foundation
 
+private enum PerUserChatDateCodec {
+    static func string(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        return formatter.string(from: date)
+    }
+
+    static func date(_ value: String) -> Date? {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        fractional.timeZone = TimeZone(secondsFromGMT: 0)
+        if let date = fractional.date(from: value) { return date }
+
+        let wholeSeconds = ISO8601DateFormatter()
+        wholeSeconds.formatOptions = [.withInternetDateTime]
+        wholeSeconds.timeZone = TimeZone(secondsFromGMT: 0)
+        return wholeSeconds.date(from: value)
+    }
+
+    static func configure(_ decoder: JSONDecoder) {
+        decoder.dateDecodingStrategy = .custom { decoder in
+            let container = try decoder.singleValueContainer()
+            let value = try container.decode(String.self)
+            guard let date = Self.date(value) else {
+                throw DecodingError.dataCorruptedError(
+                    in: container,
+                    debugDescription: "Invalid ISO 8601 chat timestamp"
+                )
+            }
+            return date
+        }
+    }
+
+    static func configure(_ encoder: JSONEncoder) {
+        encoder.dateEncodingStrategy = .custom { date, encoder in
+            var container = encoder.singleValueContainer()
+            try container.encode(Self.string(date))
+        }
+    }
+}
+
 struct ChatMergeResult: Equatable {
     let history: [PDDChatMessage]
     let insertedCount: Int
@@ -55,7 +97,7 @@ struct PerUserChatStore {
         }
 
         let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
+        PerUserChatDateCodec.configure(decoder)
         var messages: [PDDChatMessage] = []
         for (offset, line) in text.split(separator: "\n", omittingEmptySubsequences: true).enumerated() {
             do {
@@ -208,7 +250,7 @@ struct PerUserChatStore {
     ) throws -> ChatMergeResult {
         let destination = try historyURL(uid: uid, fileName: fileName, createDirectory: true)
         let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
+        PerUserChatDateCodec.configure(encoder)
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         let lines = try history.map { message -> String in
             let data = try encoder.encode(message)

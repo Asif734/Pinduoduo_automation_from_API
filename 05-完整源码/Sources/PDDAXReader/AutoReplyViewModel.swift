@@ -28,6 +28,7 @@ enum AutoReplyRuntimeCreationError: LocalizedError {
     case knowledgeResourcesUnavailable
     case senseVoiceResourcesUnavailable
     case codexPrewarmFailed
+    case pinduoduoV2Unavailable
 
     var errorDescription: String? {
         switch self {
@@ -35,6 +36,7 @@ enum AutoReplyRuntimeCreationError: LocalizedError {
         case .knowledgeResourcesUnavailable: return BilingualText.lines("主要知识目录或检索运行资源不可用", "Primary knowledge folder or retrieval runtime is unavailable")
         case .senseVoiceResourcesUnavailable: return BilingualText.lines("未找到完整的 SenseVoiceSmall INT8 资源", "Complete SenseVoiceSmall INT8 resources were not found")
         case .codexPrewarmFailed: return BilingualText.lines("Codex CLI 启动检查未通过", "Codex CLI startup check failed")
+        case .pinduoduoV2Unavailable: return BilingualText.lines("拼多多 V2 API 未就绪", "Pinduoduo V2 API is not ready")
         }
     }
 }
@@ -54,6 +56,8 @@ protocol AutoReplyRunning: AnyObject {
     var lastRuntimeIssue: String? { get }
     var latestVideoStatus: PDDVideoProgressStatus? { get }
     func setDeliveryEnabled(_ enabled: Bool)
+    func canDeleteJob(_ id: UUID) -> Bool
+    func deleteJob(_ id: UUID) throws
     func requestAXRefresh()
     func start()
     func stop()
@@ -63,6 +67,8 @@ protocol AutoReplyRunning: AnyObject {
 extension AutoReplyScheduler: AutoReplyRunning {}
 
 extension AutoReplyRunning {
+    func canDeleteJob(_ id: UUID) -> Bool { false }
+    func deleteJob(_ id: UUID) throws { throw AutoReplyJobDeletionError.unavailable }
     func reconcileVisibleIdentity(in tree: PDDAXSemanticTree) throws {}
     var latestVideoStatus: PDDVideoProgressStatus? { nil }
 }
@@ -88,6 +94,20 @@ final class AutoReplyViewModel: ObservableObject {
     var canStart: Bool { compatibilityReport?.overallStatus != .fail }
     var canStop: Bool { desiredRunning || isRunning }
 
+    func canDeleteJob(_ id: UUID) -> Bool { runtime.canDeleteJob(id) }
+
+    func deleteJob(_ id: UUID) {
+        let number = jobs.first(where: { $0.id == id })?.sequence
+        do {
+            try runtime.deleteJob(id)
+            refreshSnapshot()
+            status = BilingualText.lines("已删除任务 #\(number ?? 0)，聊天记录已保留", "Deleted task #\(number ?? 0); chat history preserved")
+        } catch {
+            refreshSnapshot()
+            status = BilingualText.lines("删除失败：\(error.localizedDescription)", "Delete failed: \(error.localizedDescription)")
+        }
+    }
+
     private let runtime: any AutoReplyRunning
     private let identity: PDDRuntimeIdentity
     private let sessionLock: any AutoReplyLocking
@@ -104,6 +124,7 @@ final class AutoReplyViewModel: ObservableObject {
     private var recoveryTask: Task<Void, Never>?
     private var prewarmTask: Task<Void, Never>?
     private var startupPrepared = false
+    private var handledInitialAppearance = false
     @Published private(set) var desiredRunning = false
 
     init(
@@ -194,15 +215,17 @@ final class AutoReplyViewModel: ObservableObject {
     }
 
     func viewAppeared() {
-        if CommandLine.arguments.contains("--start-stopped") {
+        guard !handledInitialAppearance else { return }
+        handledInitialAppearance = true
+        desiredRunning = false
+        do {
+            try runIntentStore.save(desiredRunning: false)
             status = BilingualText.lines("已停止 · 请手动开始", "Stopped · press Start when ready")
-            return
-        }
-        let persistedIntent = (try? runIntentStore.load()) ?? false
-        if identity.startsAutomatically || persistedIntent {
-            start()
-        } else {
-            status = BilingualText.lines("已停止 · 候选版需手动开始", "Stopped · this candidate build must be started manually")
+        } catch {
+            status = BilingualText.lines(
+                "已停止 · 无法重置上次运行状态：\(error.localizedDescription)",
+                "Stopped · could not reset the previous run state: \(error.localizedDescription)"
+            )
         }
     }
 
@@ -235,7 +258,7 @@ final class AutoReplyViewModel: ObservableObject {
             attemptRuntimeStart()
             return
         }
-        status = BilingualText.lines("正在预热 OCR、知识库、SenseVoice 和 Codex…", "Prewarming OCR, knowledge base, SenseVoice, and Codex…")
+        status = BilingualText.lines("正在预热 OCR、SenseVoice 并检查托管 API…", "Prewarming OCR and SenseVoice and checking the hosted API…")
         prewarmTask = Task { [weak self] in
             do {
                 try await startupPrewarm()
@@ -425,8 +448,6 @@ final class AutoReplyViewModel: ObservableObject {
         let backend = LeaseValidatedPDDAXBackend(
             base: LivePDDAXBackend(), gate: leaseGate
         )
-        let localKnowledge = DirectLocalKnowledge()
-        try localKnowledge.validate()
         let senseVoice = PDDSenseVoiceResourceLocator.resolve().flatMap { resources in
             PythonRuntimeResolver.resolve(resourceRootURL: Bundle.main.resourceURL ?? URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("Resources")).map { python in
                 PDDSenseVoiceFactory.make(resources: resources, pythonURL: python.executableURL,
@@ -468,7 +489,7 @@ final class AutoReplyViewModel: ObservableObject {
             imageDownloader: PDDCustomerImageDownloader(),
             imageRootDirectory: root.appendingPathComponent("images", isDirectory: true),
             videoArmer: videoArmer,
-            videoPreviewOpener: PDDAXVideoPreviewOpener(backend: backend)
+            videoPreviewOpener: PDDAXVideoPreviewOpener(backend: backend, logRoot: root)
         )
         let sender = PDDAXReplySender(backend: backend, opener: conversation, logRoot: root,
             observeSnapshot: { uid, snapshot in try conversation.observeSendSnapshot(uid: uid, root: snapshot) })
@@ -479,29 +500,24 @@ final class AutoReplyViewModel: ObservableObject {
             conversationDriver: conversation, sender: sender,
             transferer: transferer, leaseGate: leaseGate
         )
-        guard let codexURL = CodexInstallation.resolve() else {
-            throw AutoReplyRuntimeCreationError.codexUnavailable
-        }
-        let codexEnvironment = try CodexHomeManager(dataRoot: root).prepare()
-        let codexRunner = CodexProcessRunner(environment: codexEnvironment.values)
-        let evidencePreparer = localKnowledge
+        let credentials = PinduoduoV2EnvironmentCredentialProvider()
+        let apiClient = PinduoduoV2APIClient()
+        let deliveryRecorder = PinduoduoV2DeliveryRecorder(
+            rootDirectory: root, client: apiClient, credentials: credentials
+        )
         let scheduler = try AutoReplyScheduler(
             driver: driver,
-            generator: AutoReplyCodexGenerator(
-                executableURL: codexURL,
-                runner: codexRunner,
-                sessionRegistry: CodexSessionRegistry(rootDirectory: root),
-                evidencePreparer: evidencePreparer,
-                loginStatusProvider: CodexLoginCache(
-                    checker: LiveCodexLoginChecker(runner: codexRunner)
-                )
+            generator: PinduoduoV2ReplyGenerator(
+                rootDirectory: root, client: apiClient, credentials: credentials
             ),
+            hostedDeliveryRecorder: deliveryRecorder,
             store: AutoReplyStore(rootDirectory: root),
-            codexExecutablePath: codexURL.path
+            codexExecutablePath: PinduoduoV2Configuration.baseURL.absoluteString,
+            generationTimeout: .seconds(660)
         )
         try CustomerMessageReceipts(root: root).prepare()
         AutomationStepLog.record(root: root, uid: nil, step: "runtime-created",
-            detail: "version=\(AppBuildInfo.versionLabel); model=\(CodexInvocation.model); reasoning=\(CodexInvocation.reasoningEffort); incoming-transfer=contextual-reply; outgoing-transfer=after-sales-only; message-receipts=enabled")
+            detail: "version=\(AppBuildInfo.versionLabel); generation=pinduoduo-v2-hosted; store=pinduoduo-default; incoming-transfer=contextual-reply; outgoing-transfer=after-sales-only; message-receipts=enabled")
         let sink = AutoReplyVideoSchedulerSink(scheduler: scheduler)
         Task {
             await videoRelay.install { event in
@@ -517,7 +533,16 @@ final class AutoReplyViewModel: ObservableObject {
                     .union(batch.failedMessageIDs)
                     .union(batch.duplicateMessageIDs)
                 for messageID in batch.expectedMessageIDs where !completed.contains(messageID) {
+                    guard await videoRegistry.isEnabled(for: revision) else { return }
                     let key = PDDVideoTransferKey(uid: batch.uid, messageID: messageID)
+                    if let record = try? await videoStateStore.record(key) {
+                        if record.phase == .waitingForRetry { continue }
+                        if record.phase == .terminalFailure {
+                            await videoRelay.send(.init(uid: batch.uid, messageID: messageID,
+                                phase: .failed, diagnostic: "Video retries already exhausted; ask product problem"))
+                            continue
+                        }
+                    }
                     switch PDDBackgroundVideoRecovery.action(
                         root: videoRoot, uid: batch.uid, messageID: messageID
                     ) {
@@ -530,6 +555,9 @@ final class AutoReplyViewModel: ObservableObject {
                                 stableURL: stableURL,
                                 analysisInbox: videoAnalysisInbox,
                                 speechTranscriber: speechTranscriber,
+                                failureHandler: { error in
+                                    await videoArmer.reportFailure(uid: uid, messageID: messageID, error: error)
+                                },
                                 eventHandler: { event in await videoRelay.send(event) }
                             )
                         }
@@ -539,6 +567,20 @@ final class AutoReplyViewModel: ObservableObject {
             while await videoRegistry.isEnabled(for: revision) {
                 if let due = try? await videoStateStore.claimDueRecords() {
                     for record in due {
+                        guard await videoRegistry.isEnabled(for: revision) else { return }
+                        let stillPending = await MainActor.run {
+                            sink.pendingBatches().contains {
+                                $0.uid == record.uid && $0.expectedMessageIDs.contains(record.messageID)
+                            }
+                        }
+                        guard stillPending else {
+                            // A question already sent for this video must not
+                            // reopen the answered turn or resend that question.
+                            try? await videoStateStore.transition(key: record.key,
+                                to: .terminalFailure, failure: record.failure,
+                                failureDetail: record.failureDetail)
+                            continue
+                        }
                         let stableURL = PDDBackgroundVideoRecovery.stableVideoURL(
                             root: videoRoot, key: record.key
                         )
@@ -549,22 +591,10 @@ final class AutoReplyViewModel: ObservableObject {
                                     messageID: record.messageID, stableURL: stableURL,
                                     analysisInbox: videoAnalysisInbox,
                                     speechTranscriber: speechTranscriber, recovered: true,
-                                    failureHandler: { _ in
+                                    failureHandler: { error in
                                         try? FileManager.default.removeItem(at: stableURL)
-                                        let latest = try? await videoStateStore.record(record.key)
-                                        if let delay = PDDVideoRetryPolicy.delay(
-                                            afterFailure: latest?.retryIndex ?? 0
-                                        ) {
-                                            try? await videoStateStore.scheduleRetry(
-                                                key: record.key, category: .invalidVideo,
-                                                nextAttemptAt: Date().addingTimeInterval(delay)
-                                            )
-                                        } else {
-                                            try? await videoStateStore.transition(
-                                                key: record.key, to: .terminalFailure,
-                                                failure: .retryBudgetExhausted
-                                            )
-                                        }
+                                        await videoArmer.reportFailure(uid: record.uid,
+                                            messageID: record.messageID, error: error)
                                     },
                                     eventHandler: { event in
                                         await videoRelay.send(event)
@@ -588,15 +618,12 @@ final class AutoReplyViewModel: ObservableObject {
         }
         let prewarmer = PDDStartupPrewarmer(
             warmOCR: { try await ocrEngine.prewarm() },
-            warmKnowledge: {
-                try localKnowledge.validate()
-                _ = try await localKnowledge.versionCache.version(folder: localKnowledge.folderURL)
-            },
+            warmKnowledge: {},
             warmSenseVoice: { if let senseVoice { try await senseVoice.prepare() } },
             checkCodex: {
-                guard await CodexCompatibilityProbe().check(executableURL: codexURL) == .ready else {
-                    throw AutoReplyRuntimeCreationError.codexPrewarmFailed
-                }
+                let key = try credentials.apiKey()
+                _ = try await apiClient.status(apiKey: key, cacheLifetime: 0)
+                await deliveryRecorder.flushPending()
             }
         )
         return LiveRuntimeAssembly(runtime: scheduler, prewarmer: prewarmer)

@@ -1,0 +1,275 @@
+IMPLEMENT THE EXISTING HOSTED PINDUODUO V2 API IN THIS PINDUODUO APPLICATION
+Contract reviewed: 11 November 2026. Read this complete brief before implementation.
+
+TASK AND SCOPE
+
+Inspect this application's actual repository, framework, capture/OCR, account selection, customer identity, message scheduler, sender/transfer adapters, persistence and retry code first. Implement the integration in its existing architecture; finish meaningful tests and its normal build. Preserve unrelated features, credentials, customer records and current customer-facing action permissions. Do not replace the whole app or rewrite its sender.
+
+Only the answer-generation connection changes to the existing hosted Pinduoduo V2 API. Keep the app as capture, customer/task tracking, attachment preparation, delivery verification and actual Send/action executor. The Windows server owns approved knowledge, customer history, saved Codex sessions and answer generation.
+
+Do not add app-side RAG, embeddings, vector search, an old prepared knowledge prompt, a local answer model, OpenAI API calls, a per-customer local CLI, or a V1 fallback. Do not modify hosted/local-server code or other marketplace integrations. Do not delete old databases just because their retrieval path is no longer used.
+
+1. EXACT CONNECTION SETTINGS
+
+Origin: https://grozziie.zjweiting.com:8035
+Base URL: https://grozziie.zjweiting.com:8035/api/codex/pinduoduo/v2
+Required header: X-Pinduoduo-Key: <EXISTING_PRIVATE_PINDUODUO_API_KEY>
+Authorized storeId: pinduoduo-default
+Platform returned by this API: pinduoduo
+Display platform: Pinduoduo / 拼多多
+
+The Pinduoduo key is distinct from JD, Tmall and Bridge keys. Do not use X-Qianniu-Key, Bearer substitution, query-string credentials, or a platform field in the JSON. Do not create/rotate keys or expose a shared key in source, logs, crash dumps or a public browser bundle. Use the native app's secure credential settings; a public browser client needs a controlled backend proxy. Preserve HTTPS certificate verification and port 8035.
+
+The app calls the hosted origin, not the Windows PC's localhost:8000 or monitor:8010. It does not access Windows filesystem paths. The API key/store scope selects the correct server library and customer namespace.
+
+Pinduoduo currently has a separately stored, owner-authorized copy of the JD TECHNICAL library. This does not verify Pinduoduo prices, stock, promotions, store identity, returns/warranty terms, or applicability of JD-only tutorials. Do not import JD/Tmall branding or commercial promises. The actual store/brand policy must come from this Pinduoduo owner's trusted configuration. Do not hardcode the current library version; allow later approved Pinduoduo library updates.
+
+2. SIX EXISTING ENDPOINTS
+
+All paths below are relative to the base URL and require X-Pinduoduo-Key.
+
+GET  /status?storeId=pinduoduo-default
+POST /replies
+GET  /replies/{jobId}?storeId=pinduoduo-default
+GET  /replies/{jobId}/timing?storeId=pinduoduo-default
+GET  /conversations/{URL_ENCODED_CUSTOMER_UID}?storeId=pinduoduo-default
+POST /replies/{jobId}/delivery
+
+There is no public V2 session-create, session-delete, cancel, raw-video, raw-audio, transcription, email-send or transfer-execution endpoint. Do not invent one. The timing endpoint is diagnostic only; it does not generate or recover an answer. Normal job polling can recover the SAME original job.
+
+Before starting new batches, check status. Verify contextEnabled=true, platform=pinduoduo, storeId=pinduoduo-default, agent.connected=true, agent.contextV2Supported=true, local.enabled=true, local.library.ready=true and local.library.demo=false. A timeout is an unconfirmed observation, not proof that every accepted job failed. Cache/limit status checks; do not call /status before every poll or for every customer at the same instant.
+
+The current status may contain capabilities.orderContext="v1". This is the OPTIONAL ORDER-CONTEXT SCHEMA VERSION; the API remains V2. Only include orderContext if this exact store's status advertises that capability and the app has verified order facts.
+
+3. CUSTOMER IDENTITY, HISTORY AND FROZEN BATCHES
+
+Scope all app state by (platform=pinduoduo, storeId, customerUid). Use the stable real Pinduoduo buyer/account UID, not a display nickname, current chat window title, or a new UUID per request. The same customer must keep the same UID across app restarts and later visits. Never merge identities just because the visible names match.
+
+Persist stable message/event IDs. Prefer a native platform message ID. Otherwise use the existing capture/deduplication ledger and a durable event identity. A newly sent identical text is a NEW message; deduplicating purely by text or image hash loses real messages. Reobserving the same event must retain exactly the same ID, role, text, timestamp and media associations.
+
+Messages use roles customer, service or notice. Put only genuine customer events in customer rows, actual observed/sent replies in service rows, and platform notices in notice rows. A generated draft is not a delivered service message. Never put administrator replyInstructions in a customer/service/notice row.
+
+The server appends newly supplied events to retained history for this namespace. Send new/relevant events that have not been synchronized, including manually sent service messages needed for context. Do not resend the entire 30-day history and every old image on every question. On reconnect, synchronize genuinely unsent relevant events using their original IDs; sending an identical previously synchronized event is allowed, changing its content under the same ID is not.
+
+Important: this contract has no separate history-only write endpoint. Synchronization occurs with POST /replies, which requires at least one target customer message. Do not manufacture an unanswered customer message to upload history alone. Preserve pending history deltas until the next real batch. GET /conversations is a bounded view (last 48 messages and last 50 media metadata), not proof that all earlier history was deleted and not a complete export/pagination API.
+
+Freeze a batch of currently unanswered customer messages before sending: targetMessageIds, historyVersion, full instructions, event timestamps, media bytes and a single idempotencyKey. Several unanswered questions in that frozen batch should be answered together. Messages arriving after freezing belong to the NEXT batch; they do not replace or rewrite the accepted batch. Preserve existing guards for a human who has already answered it.
+
+historyVersion is your durable nonempty snapshot label, at most 128 characters. Keep it unchanged for retries; make a new version for a genuinely new batch. It is not a native CLI session ID and does not reset server history.
+
+Use ISO-8601 instants with Z or an explicit offset, preferably UTC. Convert China/Dhaka/other local times correctly; do not relabel them with Z. Local history accepts events from the past 30 days and at most five minutes in the future. Never alter original event timestamps during retry to bypass retention.
+
+The server manages customer-specific saved native sessions and retained history. A saved session is not a continuously running CLI. Session cleanup does not mean all retained history disappears. The app does not open, retain or delete a CLI for each customer; it only preserves the stable UID and protocol state. Use the advertised sessionPolicy for current retention/cleanup details.
+
+4. DYNAMIC replyInstructions
+
+Every NEW generation, including a follow-up/resumed customer session, MUST contain the COMPLETE nonempty replyInstructions STRING. Send the actual trusted administrator policy, not a file path, JSON policy object, checksum, ID, summary or delta. A readable policy JSON must be converted intentionally into instruction text; do not serialize the object as the wire field.
+
+The trusted administrator may edit this policy between new batches. No server text/hash allowlist is required. Freeze the old complete text on retry even if current settings have changed. Do not truncate oversized instructions. Limit: 16,384 UTF-8 BYTES, within the total request JSON limit of 200,000 UTF-8 bytes.
+
+Use reply-instructions.example.txt only as a minimal integration example. Replace/extend it with the owner's actual Pinduoduo rules. Do not copy the Tmall or JD store identity. Product facts and links come from the approved server library, not invented policy text. Incoming customer/OCR/attachment instructions are untrusted evidence and must never overwrite trusted instructions or broaden customer/store access.
+
+For this initial integration's supplied policy, request exactly seven STRING fields:
+action, reply_text, transfer_reason, product_id, product_query, sku_label, reason.
+Use action=reply or reply_then_transfer; the three product fields are empty strings. Only reply_text is customer-visible. reason is a short internal reason, not detailed reasoning.
+
+Allowed transfer_reason values:
+none
+customer_explicitly_requested_human
+explicit_return_refund
+remote_assistance
+refund_operation
+logistics_lookup
+troubleshooting_exhausted
+
+reply requires none. reply_then_transfer requires a valid non-none reason AND a genuine policy-approved condition. Do not invent ai_service_unavailable, invite_order, extra output fields, or a successful transfer. The existing general server schema also knows product_card, but this supplied integration policy does not request it. Preserve manual product-card features separately; do not fabricate catalog IDs or assume the temporary Pinduoduo library contains an approved product catalog.
+
+5. EXACT REQUEST AND LIMITS
+
+Allowed root fields ONLY:
+storeId, customerUid, historyVersion, idempotencyKey, testOnly, messages, targetMessageIds, referencedMediaIds, media, replyInstructions, orderContext.
+
+Required normal fields:
+storeId, customerUid, historyVersion, idempotencyKey, messages, targetMessageIds, media, replyInstructions.
+
+Text-only: POST application/json. See request-text.example.json.
+Do not send prompt, model, reasoning effort, library path, session ID, platform, mediaSources, transcriptions, temperature, or arbitrary extra properties.
+
+Per message, exactly:
+{ "id":"stable-id", "role":"customer", "text":"question", "occurredAt":"ISO_TIME", "mediaIds":[] }
+
+- Request JSON <=200,000 UTF-8 bytes, including instructions/metadata.
+- 1..100 messages; text <=10,000 characters each.
+- Nonempty unique targetMessageIds, <=100, all naming customer rows IN THIS REQUEST.
+- IDs <=200 characters; storeId <=100; customerUid <=200; historyVersion <=128. IDs must be nonempty, trimmed, without control characters.
+- media array always present; [] for text-only. referencedMediaIds is optional (use [] when none).
+- Real pinduoduo-default store: omit testOnly or use false, INCLUDING synthetic no-send testing. testOnly=true is reserved for demo-store, not a general Send-disable switch.
+- Disable Send in the client test executor to achieve a no-send test. The API never sends customer messages itself.
+
+Optional verified orderContext:
+{ "orders":[ {"scope":"recent","modelCode":"M880","variant":"standard","quantity":1} ] }
+Include only after capabilities.orderContext="v1" and only with actual verified facts. Omit when absent/unknown; do not send empty orders. Maximum 10 orders. Exactly scope/modelCode/variant/quantity per item. scope is recent or history. modelCode is <=40 ASCII characters, starts alphanumeric, contains a letter, and uses only letters/digits/dot/underscore/hyphen. variant is a nonempty trimmed Unicode label <=120 code points, without prohibited controls/line separators/bidi overrides. quantity is an integer 1..999. Do not send order numbers, addresses, buyer phone numbers or guessed shipping facts in this structure.
+
+6. IMAGES AND VIDEO FRAMES
+
+Use multipart/form-data for new images/frames:
+- ONE text field named request containing the entire JSON request string.
+- Repeated FILE fields named images, in exactly the media-array order.
+- Let the HTTP library encode the multipart boundary. Do not hand-set an incomplete Content-Type boundary or send images="string"/an empty dummy item.
+- A bounded Content-Length is required by hosted upload admission (maximum complete body 55 MiB). Use an upload API that can calculate/set the real body size; unbounded chunked uploads are not supported by this admission contract.
+
+Media entry, exactly:
+{ "id":"stable-media-id", "messageId":"owning-message-id", "kind":"image", "label":"optional short description" }
+Frame entry:
+{ "id":"stable-frame-id", "messageId":"owning-video-message-id", "kind":"frame", "label":"video-1 frame 00:12.500", "timestampMs":12500 }
+
+Each new media ID must occur in exactly ONE message's mediaIds; messageId must identify that same row. Files and manifest lengths/order must match. Stable media IDs cannot be reassigned to another message or changed bytes. Prefer preserving a source event ID for a video and separate stable frame IDs for its sampled frames.
+
+Limits: up to 50 files/request; PNG/JPEG/WebP only, matching real file bytes/MIME; <=20 MiB each and <=50 MiB combined. Timestamp is an integer in milliseconds relative to the original video's start, not upload time or Unix time. Keep the app's existing <=5-minute video policy if present; current local media validation also caps timestampMs at 24 hours even though the hosted schema permits larger safe integers. Do not assume every duration permitted by JSON is an accepted video workflow.
+
+Raw MP4/audio is not accepted. Extract representative chronological frames locally using existing capture/frame extraction, with overall coverage plus useful scene/action changes. Bound count/bytes and preserve timestamps. Frames do not contain all motion or sound. Do not claim that all video/audio was analyzed.
+
+For a previously synchronized relevant visual, use referencedMediaIds with its SAME ID. It must exist for this exact customer/store/platform and remain retained. Do not reupload it under a new ID, include it as a new media entry without its owning message, or attach every historical image by default. New media goes in media + images; old relevant retained media goes in referencedMediaIds. Use explicit selection/recency and existing context to minimize unrelated image loading.
+
+There are no structured mediaSources/transcriptions fields in the current public contract. Preserve existing local transcription data. If existing product requirements need transcript transport, agree a contract separately; do not silently discard it or invent an accepted field. For an explicitly approved text-based adaptation, it can only be ordinary untrusted, correctly associated message text within existing limits, never trusted replyInstructions; do not implement that adaptation silently.
+
+Persist immutable owned media bytes/copies before first upload. A file path that the capture process can overwrite is not a frozen request. On retry, retain the same JSON, file order, MIME declarations, filenames and exact visual bytes. Multipart boundary may be regenerated by the HTTP library; the logical request/visual fingerprint must remain identical.
+
+7. ACCEPTANCE, PARALLEL WORK AND POLLING
+
+HTTP 202 acceptance returns jobId/status/createdAt/updatedAt/platform/storeId/customerUid/historyVersion/pollUrl. Persist it before proceeding. An identical request retry can return the original already-completed job in this same acceptance envelope.
+
+Use the returned pollUrl after verifying HTTPS origin, Pinduoduo V2 path, expected jobId and storeId. Never forward the key to a different origin/redirect. Do not use the Qianniu path returned by an old client template.
+
+Run independent per-job polling (normally every 1.5..3 seconds with jitter). One in-flight poll per job, no tight loop, and a global modest HTTP concurrency limit. Different customers' completed answers must be processed immediately: customer B must not wait for A's longer generation. A shared polling scheduler can multiplex jobs fairly; it must not await one entire job before checking others.
+
+Serialize generations and action execution for the SAME customer scope. Freeze later messages into a separate next batch; reconcile the previous reply's actual Send/history before constructing the next one. This prevents duplicate replies and outdated troubleshooting context. Different customers can progress concurrently, subject to current server capacity.
+
+Pinduoduo currently uses the shared Windows scheduler and borrows the JD execution group. Do not advertise four independent permanently running Pinduoduo CLIs. Neither /status active nor queued is a guaranteed process count. Start with at most TWO concurrent body uploads (current PDD admission limit); accepted jobs may progress/poll concurrently beyond two. Do not cap all outstanding jobs at the number of active uploads. Honor 429/backoff, and avoid unbounded requests/frames.
+
+Use separate timeout concepts:
+- Status/poll/small JSON HTTP attempt: typically about 30 seconds.
+- Multipart upload attempt: size/network-aware and bounded (e.g. 60..300 seconds), not a universal 30-second limit for a large body.
+- Overall job wait: separately adjustable, e.g. 10 minutes including queueing. Deadline expiry means pending/recovery-needed to the client, not permission to replace the job.
+These are CLIENT recommendations, not promises of server deadlines. Preserve durable pending state and allow later recovery. Do not mark a model failure solely because a local wait timer ended.
+
+Job states:
+queued / processing: pending; keep polling.
+completed: generated draft ready for binding and app checks.
+failed: terminal generation failure; inspect error.code, do not automatically regenerate indefinitely.
+recovery_required: keep/recover the original job by bounded polling; never mint a fresh key to bypass uncertain old execution.
+expired or HTTP 410: result no longer available; old key remains reserved. Reconcile before any explicitly justified new task.
+
+8. FROZEN OUTBOX AND RESTART RECOVERY
+
+Before FIRST POST, durably save namespace, frozen target IDs, all messages, full replyInstructions, historyVersion, stable idempotencyKey (UUID), serialized request, immutable visuals and app task state. One logical batch gets ONE key.
+
+POST acceptance lost / network timeout / app crash with no jobId: replay the SAME frozen logical request and files/key with bounded backoff. Never update IDs/timestamps/policy or split the accepted batch during transport recovery.
+Known jobId: poll that job, including after restart. Do not POST a fresh job just because polling timed out.
+Persist received result/binding/digest before actual customer Send. Generation recovery and Send recovery are separate ledgers.
+
+429/network/transient 503: bounded exponential backoff with jitter and Retry-After when supplied. Preserve the original request identity. Do not retry 400/401/403/409/413/415 unchanged forever. For validation/config errors, stop this task safely and show an actionable operator error.
+
+Some Pinduoduo errors intentionally retain the QIANNIU_ prefix because the implementation shares the V2 contract. Do not reject/rewrite such errors just because the prefix is not PINDUODUO_. Important examples:
+- 401 UNAUTHORIZED: wrong/missing PDD key; configuration repair.
+- 403 QIANNIU_STORE_FORBIDDEN: unauthorized store; do not guess a new store.
+- 400 QIANNIU_INVALID_REQUEST / QIANNIU_INVALID_MESSAGE / QIANNIU_INVALID_TARGET / QIANNIU_INVALID_MEDIA_BINDING: fix protocol/event mapping.
+- QIANNIU_REPLY_INSTRUCTIONS_REQUIRED / QIANNIU_INVALID_REPLY_INSTRUCTIONS: supply the full nonempty string.
+- 413 QIANNIU_REPLY_INSTRUCTIONS_TOO_LARGE / QIANNIU_JSON_TOO_LARGE / FILE_TOO_LARGE / QIANNIU_MEDIA_TOO_LARGE / QIANNIU_INVALID_BODY_SIZE: validate real byte limits. Never silently truncate a frozen request.
+- 415 QIANNIU_INVALID_MEDIA / QIANNIU_INVALID_CONTENT_TYPE: fix actual MIME/encoding.
+- 429 QIANNIU_UPLOAD_BUSY / QIANNIU_QUEUE_FULL / QIANNIU_CONTROL_BUSY: bounded backoff; distinct from model-provider limits.
+- 503 AGENT_OFFLINE / AGENT_UPGRADE_REQUIRED / QIANNIU_CONTEXT_DISABLED / QIANNIU_LEDGER_UNAVAILABLE: readiness/recovery, not customer fault.
+- 503 QIANNIU_ORDER_CONTEXT_UNAVAILABLE: do not silently strip facts from an uncertain accepted request. Verify capability before a genuinely new batch.
+- 409 QIANNIU_IDEMPOTENCY_CONFLICT: same key, changed fingerprint; investigate stored batch. Do not evade it with a new UUID.
+- Other job errors, including CODEX_FAILED, must keep their recorded code. Do not infer account, network or image failure without evidence.
+
+Use max-attempts/time budgets; keep exhausted uncertain tasks parked/recoverable. Never resend customer text as a side effect of a transport retry.
+
+9. COMPLETED RESULT VALIDATION AND APP OUTPUT ADAPTER
+
+Before showing/sending a generated reply, validate:
+1. Outer jobId/platform/storeId/customerUid/historyVersion match the frozen expected batch.
+2. binding contains exactly those five identities, including platform=pinduoduo.
+3. resultDigest is a nonempty digest-shaped string (64 lowercase hex with optional sha256: prefix). Preserve it byte-for-byte as an opaque token. Do not recompute it from formatted JSON or invent a signature check.
+4. reply has exactly seven required STRING fields, with nonempty reply_text and allowed action/reason combinations for the chosen policy.
+5. Existing app account/customer-routing, manual-reply, permission, stale-task and duplicate-Send guards pass.
+
+Map reply_text into the existing sender input. Only that text is customer-visible. Preserve useful line breaks and approved URLs. Do not send the whole JSON, reason, internal IDs, policy text, server paths or status messages. Do not replace a source link with a guessed download URL or auto-run downloaded programs.
+
+If the old app expects extra AI fields (confidence, auto_send_allowed, attachments, used_record_ids, ask_clarification, etc.), implement a deliberate typed adapter. Those fields are NOT in this V2 result; do not fabricate them or turn missing auto_send_allowed into true. Preserve real existing validation/action permissions; identify any blocking contract gap explicitly.
+
+The answer is a proposal, not authority to send email, issue refunds, execute remote access or transfer a customer. The actual existing authorized app adapters perform customer-facing actions. Do not claim an operation succeeded without executor evidence.
+
+10. ACTUAL SEND AND DELIVERY ACK (REQUIRED FOR CORRECT HISTORY/MONITOR)
+
+Keep a durable execution ledger keyed by namespace + jobId + resultDigest. Recheck the correct Pinduoduo account/store/customer immediately before Send. Marking a draft completed, filling the input box, or clicking Send does NOT prove sent. Verify a reliable native platform Send acknowledgement/message ID or an unambiguous newly sent matching row for this customer. Customer read receipt is not required and must not be claimed.
+
+After verified Send, POST /replies/{jobId}/delivery with application/json:
+{
+ "storeId":"pinduoduo-default",
+ "eventId":"<DURABLY_PERSISTED_NEW_DELIVERY_EVENT_ID>",
+ "status":"sent",
+ "occurredAt":"<ACTUAL_EVIDENCE_TIME_ISO_8601>",
+ "resultDigest":"<EXACT_DIGEST_FROM_THIS_COMPLETED_RESULT>",
+ "actualSentText":"<EXACT_TEXT_REALLY_SENT_TO_THIS_CUSTOMER>"
+}
+
+actualSentText is optional, nonempty, <=10,000 characters, ONLY with sent. Include it when the app's policy guards changed the final text so server history reflects reality. If omitted, server records the original generated reply text. If an edited answer exceeds the supported limit, do not silently truncate/misreport it; retain the local evidence and flag the contract mismatch.
+
+Success response is HTTP 200:
+{ "jobId":"...", "storeId":"pinduoduo-default", "eventId":"...", "status":"sent", "occurredAt":"...", "resultDigest":"...", "actualSentText":"...", "recorded":true }
+actualSentText is echoed only when supplied. Check matching job/event/digest/status and recorded=true. Persist ACK success. Response means durable server delivery-record acknowledgement, not a second customer Send.
+
+Delivery meanings:
+sent: reliable evidence the reply text actually left the app through the correct PDD sender.
+failed: definite Send failure / confirmed not sent.
+unknown: attempted Send outcome cannot yet be determined, e.g. crash/ambiguous timeout.
+pending/not recorded: no delivery outcome has been acknowledged yet; normal for synthetic no-send tests. Do not fabricate sent or pretend an unattempted draft was delivered.
+
+For unknown, reconcile platform evidence before any retry of actual Send. When later confirmed sent/failed, create a NEW delivery eventId with the newly established status/time. Do NOT mutate the old unknown event. The server supports unknown-to-confirmed transitions, and a confirmed sent result is not downgraded by a later uncertain report.
+
+If ACK response is lost or 503 QIANNIU_DELIVERY_UNCONFIRMED occurs, retry the IDENTICAL persisted delivery event, same eventId/body/time/digest. Do not resend customer text. Same eventId with changed fields is 409 QIANNIU_DELIVERY_CONFLICT; wrong job/digest is QIANNIU_DELIVERY_RESULT_CONFLICT.
+
+Persist the delivery outbox before posting it; recover it on app restart. Reconcile unresolved ACKs promptly, within available result retention. The hosted polling-result TTL defaults to 48 hours but is configurable; it differs from local 30-day conversation retention. Do not postpone ACKs until retention expires.
+
+The server appends confirmed sent text to service history on sent ACK. To avoid duplicate history, do not also blindly upload the same bot-generated service row under a second native capture ID. Correlate it in the app execution ledger. Genuinely manual or different service messages still need normal synchronization with stable IDs.
+
+For reply_then_transfer, preserve authorized transfer-adapter behavior and log text-Send and transfer outcome separately. Delivery sent describes the reply TEXT, not proof that the human handoff succeeded. Do not send unknown/failed transfer outcome as if the customer text was unsent, or invent a transfer-status API.
+
+11. DIAGNOSTICS AND RESPONSE SPEED
+
+Log UTC instants plus monotonic durations for batch frozen, upload start/end, 202 received, jobId persisted, poll state changes, completed result received, sender start, Send evidence and ACK start/result. Use jobId/platform/storeId/historyVersion and safe correlation IDs. Default logs must not dump API keys, auth headers, full prompts, customer images or private history. Follow the app's authorized private diagnostic retention for deeper evidence.
+
+Distinguish upload time, acceptance wait, queue/generation, poll observation delay, actual Send and ACK time. The local monitor's Local response time is recorded generation duration, NOT whole customer turnaround. Its hosted finish timestamp means server-side response writing completed, not proof the app received or sent it. Cross-PC clocks can differ; do not infer negative network latency from mismatched clocks.
+
+GET /replies/{jobId}/timing can support operator diagnostics without a new generation. Do not call it on every poll; fetch on demand or once after a problem. It returns version/jobId/platform/storeId/available/events; version=1 here is timing-evidence schema version, not a V1 generation API.
+
+Do not improve speed by dropping trusted instructions, known user facts, pending batch questions, binding checks or actual Send verification. Improve it by smaller relevant deltas/media, bounded uploads, independent concurrent customers, fair polling and correct restart recovery.
+
+12. IMPLEMENTATION AND TEST ACCEPTANCE
+
+Implement a focused PDD V2 API client + durable generation/delivery outboxes + scheduler/output adapter around the existing capture/sender. Keep protocol logic testable without real customer Send. Use the current repository's architecture/language and existing dependencies where practical.
+
+Offline tests must cover:
+- Correct origin, PDD path/header/store, no credential leakage; no JD/Tmall key reuse.
+- Text request, image multipart and multiple frame/message associations.
+- Missing/empty/too-large instructions, byte limits and unsupported fields.
+- Stable IDs, same text as a new event, recapture of an old event, conflicting ID content.
+- Multiple questions per frozen batch and later messages queued separately.
+- Three customers completed out of submission order: return B immediately even if A is still processing.
+- Same customer's second batch cannot overtake the first.
+- Lost acceptance: same frozen POST/key; known job restart: poll original.
+- 429/503 bounded retry, auth/validation stop, recovery_required and expired handling.
+- Invalid/cross-customer result binding/digest/output rejected before Send.
+- Actual Send confirmed, definite failure, ambiguous outcome and restart after click.
+- Unknown-to-sent with NEW delivery event; lost ACK retries the SAME event without re-Send.
+- A manual reply, wrong active customer and duplicate completed polling cannot cause duplicate Send.
+- No app-side model/RAG/V1 fallback or automatic external actions were introduced.
+
+Run normal build/tests. Then, with a correctly configured private PDD key and the app's synthetic NO-SEND executor, run a small end-to-end check: one technical text question, one clearly labelled synthetic image, then a follow-up for the first UID. No real customer messages, transfers or email for this validation. Replace example UUIDs/timestamps with new runtime values. Use synthetic-pdd-... UIDs and pinduoduo-default; do not set testOnly=true.
+
+Verify HTTP202, correct PDD pollUrl, completed binding/resultDigest/seven fields, image interpretation and same-UID history. Verify the Windows local monitor shows each request, answer, platform and generation duration. Delivery remains pending for no-send tests; ACK logic is tested with mocks until an authorized actual Send provides evidence. Do not falsely ACK a synthetic draft as sent just to make the monitor green.
+
+Already verified server evidence on 11 Nov 2026: three synthetic questions completed, including an image and a saved-history follow-up. Recorded local generation times were 16.2s / 7.7s / 8.6s; observed full API waits were 17.9s / 10.2s / 9.7s. These are sample measurements, not performance guarantees.
+
+When finished, report changed app files, typed contract mapping, tests/build result, sanitized job IDs/timings for any allowed live tests, unresolved gaps and how to enable/use the integration. Do not claim customer delivery, production deployment or transfer verification unless actually evidenced. Do not change hosted/local server APIs to make a client test pass.

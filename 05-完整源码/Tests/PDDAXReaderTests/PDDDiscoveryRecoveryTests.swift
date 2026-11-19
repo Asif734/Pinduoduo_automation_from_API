@@ -3,6 +3,32 @@ import XCTest
 
 @MainActor
 final class PDDDiscoveryRecoveryTests: XCTestCase {
+    func testDiscoveryReacquiresRowAfterTransientPressFailure() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = InvestigationPDD(); backend.aHydrated = true; backend.unreadB = false
+        backend.pressFailuresRemaining = 1
+        backend.replaceTokensAfterFailure = true
+        let (driver, a, _) = try setup(root, backend: backend, clock: InvestigationClock())
+        let found = try await driver.discover()
+        XCTAssertEqual(found.first?.uid, a)
+        XCTAssertEqual(backend.pressed, [2, 1002])
+        XCTAssertGreaterThan(backend.pressReadCounts[1], backend.pressReadCounts[0], "Retry must read a fresh row token")
+        XCTAssertGreaterThanOrEqual(backend.reads, 3)
+        XCTAssertTrue(backend.writes.isEmpty)
+    }
+
+    func testPersistentPressFailureRemainsBoundedAndRetainsDiscoveryTask() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = InvestigationPDD(); backend.aHydrated = true; backend.unreadB = false
+        backend.pressFailuresRemaining = 10
+        let (driver, _, _) = try setup(root, backend: backend, clock: InvestigationClock())
+        do { _ = try await driver.discover(); XCTFail("Persistent failure must yield the UI") } catch {}
+        XCTAssertEqual(backend.pressed, [2, 2])
+        XCTAssertFalse(try PDDPendingDiscoveryStore(root: root).load().isEmpty)
+    }
+
     func testOldHistoryWithoutNewBatchDoesNotConsumeUnreadCaptureTask() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -141,7 +167,7 @@ final class PDDDiscoveryRecoveryTests: XCTestCase {
         XCTAssertEqual(backend.pressed.count, count)
     }
 
-    func testCoalescedUnreadWithIdenticalPreviewGetsSlowVerificationAndFindsNewMessageID() async throws {
+    func testHandledIdenticalPreviewNeedsFreshUnreadEdgeBeforeReselectingChat() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let backend = InvestigationPDD(); backend.unreadA = false; backend.previewB = "same question"
@@ -150,7 +176,16 @@ final class PDDDiscoveryRecoveryTests: XCTestCase {
         _ = try await driver.discover()
         try captured(b, backend: backend, driver: driver, root: root)
         backend.currentA = true; backend.unreadB = true; backend.partialB = "newB-again"
+        let previousSelections = backend.pressed.count
         clock.date += 31
+        _ = try await driver.discover()
+        XCTAssertEqual(backend.pressed.count, previousSelections, "Elapsed time alone must not select another chat")
+
+        backend.unreadB = false
+        clock.date += 1
+        _ = try await driver.discover()
+        backend.unreadB = true
+        clock.date += 1
         let found = try await driver.discover()
         XCTAssertEqual(found.first?.uid, b)
         XCTAssertTrue(found.first?.hasUncapturedCustomerMessages == true)
@@ -326,6 +361,46 @@ final class PDDDiscoveryRecoveryTests: XCTestCase {
         let diagnostic = try JSONDecoder().decode(PDDAXCaptureDiagnostic.self, from: Data(contentsOf: file))
         XCTAssertEqual(diagnostic.ownerCandidates, [a, b])
         XCTAssertFalse(diagnostic.submittedToCodex)
+    }
+
+    func testStaleDiscoveryOwnerYieldsToVerifiedActiveHistoryWithoutReopening() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = InvestigationPDD(); backend.aHydrated = true; backend.unreadB = false
+        let clock = InvestigationClock()
+        let (driver, verified, stale) = try setup(root, backend: backend, clock: clock)
+        let store = PDDPendingDiscoveryStore(root: root)
+        var task = PDDPendingDiscovery(locator: .init(nickname: "A***"), occurrence: 0,
+            unread: true, at: clock.date.addingTimeInterval(-100))
+        task.resolvedUID = stale
+        task.observedCustomerIDs = [investigationMessage("oldB").id]
+        try store.save([task])
+
+        let result = try await driver.discover()
+        XCTAssertEqual(result.map(\.uid), [verified])
+        XCTAssertEqual(result.first?.hasUncapturedCustomerMessages, true)
+        let inbox = PDDVerifiedCaptureInbox(root: root)
+        XCTAssertEqual(try inbox.load(uid: verified)?.messages.map(\.content), ["oldA", "newA"])
+        XCTAssertNil(try inbox.load(uid: stale))
+        XCTAssertEqual(try PDDConversationIdentityStore(root: root).canonicalUID(stale), stale)
+        XCTAssertEqual(try store.load().first?.resolvedUID, stale)
+        try captured(verified, backend: backend, driver: driver, root: root)
+
+        backend.currentA = false
+        clock.date += 60
+        let restarted = PDDAXConversationDriver(backend: backend, chatStore: .init(rootDirectory: root),
+            allowedUIDs: nil, unreadEvidence: backend, now: { clock.date })
+        _ = try await restarted.discover()
+        _ = try await restarted.discover()
+        XCTAssertEqual(backend.pressed, [2])
+
+        backend.partialA = "laterA"
+        backend.unreadA = true
+        let fresh = try await restarted.discover()
+        XCTAssertEqual(fresh.map(\.uid), [verified])
+        XCTAssertEqual(backend.pressed, [2, 2], "A fresh unread edge still selects the correct chat")
+        XCTAssertTrue(try XCTUnwrap(inbox.load(uid: verified)).messages.contains { $0.content == "laterA" })
+        XCTAssertTrue(backend.writes.isEmpty)
     }
 
     func testVerifiedMessagesSurviveSwitchAndRestartWithoutSecondLiveRead() async throws {
@@ -610,7 +685,21 @@ private final class InvestigationPDD: PDDAXBackend, PDDUnreadEvidenceDetecting {
     var pendingSelectionReads: Int?
     var refreshes = 0
     var pressed: [Int] = []
+    var pressFailuresRemaining = 0
+    var pressReadCounts: [Int] = []
+    var replaceTokensAfterFailure = false
+    private var tokenOffset = 0
     func readSemanticTree() throws -> PDDAXSemanticTree {
+        let tree = try readSnapshot()
+        guard tokenOffset > 0 else { return tree }
+        return .init(rootSnapshot: tree.rootSnapshot, nodes: tree.nodes.map { node in
+            .init(id: .init(rawValue: node.id.rawValue + tokenOffset),
+                parentID: node.parentID.map { .init(rawValue: $0.rawValue + tokenOffset) },
+                role: node.role, value: node.value, title: node.title, domIdentifier: node.domIdentifier,
+                domClasses: node.domClasses, actionNames: node.actionNames, isSettable: node.isSettable, frame: node.frame)
+        })
+    }
+    private func readSnapshot() throws -> PDDAXSemanticTree {
         reads += 1
         if failReads { throw CocoaError(.fileReadUnknown) }
         if let remaining = pendingSelectionReads {
@@ -657,13 +746,20 @@ private final class InvestigationPDD: PDDAXBackend, PDDUnreadEvidenceDetecting {
     }
     func performPress(_ id: AXElementToken) throws {
         pressed.append(id.rawValue)
-        if id.rawValue == 2 {
+        pressReadCounts.append(reads)
+        if pressFailuresRemaining > 0 {
+            pressFailuresRemaining -= 1
+            if replaceTokensAfterFailure { tokenOffset = 1000 }
+            throw PDDAXBackendError.actionFailed(.cannotComplete)
+        }
+        guard id.rawValue >= tokenOffset else { throw PDDAXBackendError.staleElement }
+        if id.rawValue - tokenOffset == 2 {
             if !ignoreASelection {
                 if selectionDelayReads > 0 { pendingSelectionReads = selectionDelayReads } else { currentA = true }
             }
             unreadA = false
         }
-        if id.rawValue == 4 { currentA = false; unreadB = false }
+        if id.rawValue - tokenOffset == 4 { currentA = false; unreadB = false }
     }
     func unreadRows(in tree: PDDAXSemanticTree) async throws -> [PDDConversationRow<AXElementToken>] {
         var rows: [PDDConversationRow<AXElementToken>] = []

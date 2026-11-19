@@ -11,10 +11,11 @@ SIGNING_IDENTITY="$($PROJECT_ROOT/scripts/select_codesign_identity.sh)"
 PYTHON_RUNTIME_NAME="cpython-3.12.14+20260825-aarch64-apple-darwin-install_only_stripped.tar.gz"
 PYTHON_RUNTIME_SHA256="8b0f1fa71eab7ca644e482c631807a1116fa848491051cd1c8d9429491de63a6"
 PYTHON_RUNTIME_ROOT="$PROJECT_ROOT/Resources/ThirdParty/PythonRuntime"
-SWIFT_BUILD_ARGS=()
+SWIFT_SCRATCH_PATH="${PDD_SWIFT_SCRATCH_PATH:-/private/tmp/pdd-auto-reply-app-build}"
+SWIFT_BUILD_ARGS=(--scratch-path "$SWIFT_SCRATCH_PATH")
 SWIFT_UI_PLUGIN_ROOT="/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib/swift/host/plugins"
 if [[ -f "$SWIFT_UI_PLUGIN_ROOT/libSwiftUIMacros.dylib" ]]; then
-    SWIFT_BUILD_ARGS=(--build-system native -Xswiftc -plugin-path -Xswiftc "$SWIFT_UI_PLUGIN_ROOT")
+    SWIFT_BUILD_ARGS+=(--build-system native -Xswiftc -plugin-path -Xswiftc "$SWIFT_UI_PLUGIN_ROOT")
 fi
 
 sign_and_verify() {

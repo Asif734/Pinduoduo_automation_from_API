@@ -10,16 +10,24 @@ enum PDDConversationIdentityRecovery {
         guard !proof.isEmpty, proof.isSubset(of: ids),
               jobs.allSatisfy({ $0.capture.batch?.incomingHandoffKey == nil }) else { return nil }
         let timeline = try AutoReplyTimeline.make(messages: history)
-        guard timeline.validatesPrefix(cursor), let batch = try timeline.freeze(after: cursor) else { return nil }
+        guard timeline.validatesPrefix(cursor) else { return nil }
         let targets = jobs.reduce(into: Set<String>()) {
             $0.formUnion($1.capture.batch?.customerMessageIDs ?? [])
             $0.formUnion($1.pendingSupplement?.batch?.customerMessageIDs ?? [])
         }
-        guard targets.subtracting(covered).isSubset(of: batch.customerMessageIDs) else { return nil }
-        let events = batch.events.filter { !covered.contains($0.messageID) }
+        let pending = targets.subtracting(covered)
+        guard pending.isSubset(of: ids) else { return nil }
+        // A later confirmed reply can advance the cursor past a still-unsent
+        // job. Recover only its exact targets, not the entire older prefix.
+        // Keep the validated cursor and sent receipts; neither proves that a
+        // different pending target was delivered.
+        let events = timeline.events.enumerated().compactMap { index, event in
+            !covered.contains(event.messageID) && (index >= cursor.count || pending.contains(event.messageID))
+                ? event : nil
+        }
         guard !events.isEmpty else { return nil }
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        let filtered = FrozenCustomerBatch(startCursor: batch.startCursor, endCursor: batch.endCursor, events: events,
+        let filtered = FrozenCustomerBatch(startCursor: cursor, endCursor: timeline.cursor, events: events,
             targetCustomerJSONL: try events.map { String(decoding: try encoder.encode($0), as: UTF8.self) }.joined(separator: "\n"))
         let captures = jobs.flatMap { [$0.capture] + ($0.pendingSupplement.map { [$0] } ?? []) }
         let images = captures.flatMap(\.imageAttachments).reduce(into: [String: AutoReplyImageAttachment]()) { $0[$1.messageID] = $1 }

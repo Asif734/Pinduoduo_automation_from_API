@@ -2,6 +2,21 @@ import XCTest
 @testable import PDDAXReader
 
 final class PDDVideoTransferStateTests: XCTestCase {
+    func testThreeRetryBudgetIsPersistedAcrossRestart() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = PDDDurableVideoTransferStore(url: root.appendingPathComponent("state.json"))
+        let key = PDDVideoTransferKey(uid: "customer", messageID: "video")
+        _ = try await store.begin(key: key, uid: "customer", messageID: "video")
+        for _ in 0..<PDDVideoRetryPolicy.maximumRetries {
+            try await store.scheduleRetry(key: key, category: .previewUnavailable, nextAttemptAt: .distantPast)
+        }
+        let restarted = PDDDurableVideoTransferStore(url: root.appendingPathComponent("state.json"))
+        let record = try await restarted.record(key)
+        XCTAssertEqual(record?.retryIndex, 3)
+        XCTAssertNil(PDDVideoRetryPolicy.delay(afterFailure: try XCTUnwrap(record?.retryIndex)))
+    }
+
     func testFailureClassificationDistinguishesPreviewAddressAndMediaProblems() {
         XCTAssertEqual(PDDVideoTransferFailureCategory.classify(PDDCustomerVideoError.clickFailed), .previewUnavailable)
         XCTAssertEqual(PDDVideoTransferFailureCategory.classify(PDDCustomerVideoError.cacheUnavailable), .localFile)

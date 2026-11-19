@@ -237,7 +237,7 @@ final class AutoReplyViewModelTests: XCTestCase {
         XCTAssertEqual(lock.releaseCount, 1)
     }
 
-    func testViewAppearanceStartsLiveRuntimeAutomatically() {
+    func testProductionViewAppearanceRemainsStoppedUntilExplicitStart() {
         let runtime = FakeAutoReplyRuntime()
         let model = AutoReplyViewModel(
             runtime: runtime,
@@ -248,9 +248,9 @@ final class AutoReplyViewModelTests: XCTestCase {
 
         model.viewAppeared()
 
-        XCTAssertTrue(model.isRunning)
-        XCTAssertEqual(runtime.deliveryEnabledValues.first, true)
-        XCTAssertEqual(runtime.startCount, 1)
+        XCTAssertFalse(model.isRunning)
+        XCTAssertEqual(runtime.startCount, 0)
+        XCTAssertTrue(model.status.contains("已停止"))
     }
 
     func testCandidateViewAppearanceRemainsStoppedUntilExplicitStart() {
@@ -281,7 +281,7 @@ final class AutoReplyViewModelTests: XCTestCase {
             permissionCheck: { true }, screenRecordingPermissionCheck: { true },
             axNotificationListener: FakeAXNotificationListener()
         )
-        model.viewAppeared()
+        model.start()
 
         model.viewDisappeared()
 
@@ -372,7 +372,7 @@ final class AutoReplyViewModelTests: XCTestCase {
         XCTAssertFalse(try intent.load())
     }
 
-    func testCandidateRestartsWhenPersistedIntentIsRunning() throws {
+    func testNewLaunchClearsPersistedRunningIntentAndRequiresExplicitStart() throws {
         let home = FileManager.default.temporaryDirectory
             .appendingPathComponent("pdd-view-model-resume", isDirectory: true)
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -392,8 +392,10 @@ final class AutoReplyViewModelTests: XCTestCase {
 
         model.viewAppeared()
 
-        XCTAssertTrue(model.isRunning)
-        XCTAssertEqual(runtime.startCount, 1)
+        XCTAssertFalse(model.isRunning)
+        XCTAssertEqual(runtime.startCount, 0)
+        XCTAssertFalse(try intent.load())
+        XCTAssertTrue(model.status.contains("已停止"))
     }
 }
 

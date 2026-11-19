@@ -56,6 +56,13 @@ final class LeaseValidatedPDDAXBackend: PDDAXBackend {
         return result
     }
 
+    func readSemanticTreeForObservation() throws -> PDDAXSemanticTree {
+        try gate.validate()
+        let result = try base.readSemanticTreeForObservation()
+        try gate.validate()
+        return result
+    }
+
     func performPress(_ id: AXElementToken) throws {
         try gate.validate()
         try base.performPress(id)
