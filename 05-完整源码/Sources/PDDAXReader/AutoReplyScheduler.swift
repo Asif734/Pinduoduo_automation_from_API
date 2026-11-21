@@ -631,7 +631,8 @@ final class AutoReplyScheduler: ObservableObject {
                 expectedMessageIDs: pending.expectedMessageIDs.filter { !dismissed.contains($0) },
                 completedAttachmentsByMessageID: pending.completedAttachmentsByMessageID.filter { !dismissed.contains($0.key) },
                 failedMessageIDs: pending.failedMessageIDs.subtracting(dismissed),
-                duplicateMessageIDs: pending.duplicateMessageIDs.subtracting(dismissed), createdAt: pending.createdAt)
+                duplicateMessageIDs: pending.duplicateMessageIDs.subtracting(dismissed),
+                allowsIndependentText: pending.allowsIndependentText, createdAt: pending.createdAt)
         }
         state.deferredVideoTransferEvents.removeAll { relatedUIDs.contains($0.uid) && dismissed.contains($0.messageID) }
         for index in state.videoHoldingNotices.indices where relatedUIDs.contains(state.videoHoldingNotices[index].uid)
@@ -723,12 +724,6 @@ final class AutoReplyScheduler: ObservableObject {
         }
         guard !manuallyDeletedMessageIDs(uid: event.uid).contains(event.messageID) else { return }
         latestVideoStatus = PDDVideoProgressStatus(event: event)
-        if [.waitingForAddress, .downloading, .downloaded, .preparingEvidence, .readyForGeneration].contains(event.phase) {
-            registerVideoHold(
-                uid: event.uid,
-                messageIDs: recentVideoMessageIDs(uid: event.uid, candidates: [event.messageID])
-            )
-        }
         onStateChange?()
         appendEvent(
             uid: event.uid,
@@ -748,7 +743,7 @@ final class AutoReplyScheduler: ObservableObject {
                 return
             }
             if event.phase == .readyForGeneration || event.phase == .duplicate
-                || event.phase == .failed || event.phase == .fallbackRequired
+                || event.phase == .failed
                 || event.phase == .waitingForRetry {
                 state.deferredVideoTransferEvents.removeAll {
                     $0.uid == event.uid && $0.messageID == event.messageID
@@ -774,10 +769,11 @@ final class AutoReplyScheduler: ObservableObject {
                 }
                 state.pendingVideoBatches[index]
                     .completedAttachmentsByMessageID[event.messageID] = attachment
-            case .fallbackRequired, .waitingForRetry:
+            case .waitingForRetry:
+                releaseTextFromRetryingVideoBatch(at: index)
+            case .fallbackRequired:
                 continue
             case .failed:
-                // Only exhausted retries resolve the batch as a failed video.
                 guard state.pendingVideoBatches[index]
                     .completedAttachmentsByMessageID[event.messageID] == nil,
                       !state.pendingVideoBatches[index].duplicateMessageIDs.contains(event.messageID)
@@ -843,10 +839,7 @@ final class AutoReplyScheduler: ObservableObject {
                 try persist()
             }
             await drainDeferredVideoTransferEvents()
-            refreshVideoHoldingNotices()
             _ = launchQueuedGenerations()
-
-            if try await sendDueVideoHoldingNotice() { return }
 
             if state.consecutiveDeliveryCount >= 3 || workTurnsSinceDiscovery >= 3
                 || (workTurnsSinceDiscovery > 0 && now().timeIntervalSince(lastDiscoveryAt) >= 5) {
@@ -1229,7 +1222,8 @@ final class AutoReplyScheduler: ObservableObject {
                 }
                 guard !active.contains(where: { $0.state == .generating || (!$0.outgoingImages.isEmpty && $0.stageAttempt > 0) }),
                       let capture = try PDDConversationIdentityRecovery.currentThreadCapture(canonicalUID: canonical,
-                        after: answeredCursor(canonical), jobs: active, root: store.rootDirectory, covered: covered) else {
+                        after: answeredCursor(canonical), jobs: active, root: store.rootDirectory,
+                        covered: covered, knownJobs: state.jobs) else {
                     identityRecoveryRetryAt[canonical] = now().addingTimeInterval(15)
                     appendEvent(uid: canonical, kind: "identity-recovery-waiting",
                         detail: "需完整会话依据或等待在途工作结束；15秒后复查；其他客户继续")
@@ -1891,102 +1885,6 @@ final class AutoReplyScheduler: ObservableObject {
         } catch { appendEvent(uid: uid, kind: "pre-send-tail-check-deferred", detail: error.localizedDescription) }
     }
 
-    private func registerVideoHold(uid: String, messageIDs: Set<String>) {
-        guard !messageIDs.isEmpty else { return }
-        let known = Set(state.videoHoldingNotices.filter { $0.uid == uid }.flatMap { $0.messageIDs })
-        let sent = (try? CustomerMessageReceipts(root: store.rootDirectory).receipts(uid: uid)) ?? [:]
-        let fresh = messageIDs.subtracting(known).subtracting(manuallyDeletedMessageIDs(uid: uid))
-            .filter { sent[$0]?.replySentAt == nil && sent[$0]?.closedAt == nil }
-        guard !fresh.isEmpty else { return }
-        refreshVideoHoldingNotices()
-        if let index = state.videoHoldingNotices.firstIndex(where: { $0.uid == uid && $0.finishedAt == nil }) {
-            state.videoHoldingNotices[index].messageIDs.formUnion(fresh)
-        } else {
-            state.videoHoldingNotices.append(.init(uid: uid, messageIDs: Set(fresh), capturedAt: now()))
-        }
-        appendEvent(uid: uid, kind: "video-hold-timer-started", detail: "delay_seconds=10 message_ids=\(fresh.sorted().joined(separator: ","))")
-    }
-
-    private func recentVideoMessageIDs(
-        in capture: AutoReplyCapture,
-        candidates: Set<String>
-    ) -> Set<String> {
-        let oldestEligible = now().addingTimeInterval(-120)
-        let messages = Dictionary(uniqueKeysWithValues: capture.fullHistory.map { ($0.id, $0) })
-        return candidates.filter { id in
-            guard let message = messages[id], message.sender == .customer,
-                  message.kind == .video else { return false }
-            return message.capturedAt >= oldestEligible
-        }
-    }
-
-    private func recentVideoMessageIDs(uid: String, candidates: Set<String>) -> Set<String> {
-        var captures = state.pendingVideoBatches.filter { $0.uid == uid }.map(\.capture)
-        captures.append(contentsOf: state.jobs.filter { $0.uid == uid }.map(\.capture))
-        if let latestCapture, latestCapture.uid == uid { captures.append(latestCapture) }
-        return captures.reduce(into: Set<String>()) { result, capture in
-            result.formUnion(recentVideoMessageIDs(in: capture, candidates: candidates))
-        }
-    }
-
-    private func refreshVideoHoldingNotices() {
-        for index in state.videoHoldingNotices.indices where state.videoHoldingNotices[index].finishedAt == nil {
-            let notice = state.videoHoldingNotices[index]
-            let terminal = Set(state.jobs.filter {
-                $0.uid == notice.uid && [.completed, .failed, .quarantined].contains($0.state)
-            }.flatMap { $0.capture.batch?.customerMessageIDs ?? [] })
-            if notice.messageIDs.isSubset(of: terminal) {
-                state.videoHoldingNotices[index].finishedAt = now()
-                appendEvent(uid: notice.uid, kind: "video-hold-finished", detail: "final work terminal; notice=\(notice.id)")
-            }
-        }
-    }
-
-    private func sendDueVideoHoldingNotice() async throws -> Bool {
-        guard deliveryEnabled, !realDeliveryPausedForPersistence else { return false }
-        guard let index = state.videoHoldingNotices.firstIndex(where: { notice in
-            notice.finishedAt == nil && notice.attemptedAt == nil && now().timeIntervalSince(notice.capturedAt) >= 10
-                && videoHoldCapture(for: notice) != nil
-                && !state.jobs.contains { $0.uid == notice.uid && [.ready, .sending].contains($0.state) }
-        }) else { return false }
-        let notice = state.videoHoldingNotices[index]
-        guard let capture = videoHoldCapture(for: notice) else { return false }
-        // Save the attempt before any UI action. Uncertain sends are never replayed.
-        state.videoHoldingNotices[index].attemptedAt = now()
-        appendEvent(uid: notice.uid, kind: "video-hold-send-started", detail: "notice=\(notice.id) message=\(notice.text)")
-        try persist(sendCritical: true)
-        currentUIOwner = "video-hold:\(notice.uid)"
-        defer { currentUIOwner = nil }
-        do {
-            let result = try await performUI(stage: "send", uid: notice.uid) { driver, lease in
-                try await driver.send(uid: notice.uid, text: notice.text, outgoingImages: [], deliveryID: notice.id,
-                    expectedCustomerCursor: capture.customerCursor, expectedCustomerMessageIDs: notice.messageIDs, lease: lease)
-            }
-            switch result {
-            case .sent(let id):
-                state.videoHoldingNotices[index].outcome = "sent"
-                state.videoHoldingNotices[index].confirmedServiceMessageID = id
-                state.confirmedAutoReplyMessageIDsByUID[notice.uid, default: []].insert(id)
-            case .failedBeforeSend, .discardedBeforeSend, .wordingRejected: state.videoHoldingNotices[index].outcome = "not-sent"
-            case .uncertain: state.videoHoldingNotices[index].outcome = "uncertain"
-            }
-            appendEvent(uid: notice.uid, kind: "video-hold-send-result", detail: "notice=\(notice.id) \(result); final reply still required")
-        } catch {
-            state.videoHoldingNotices[index].outcome = "uncertain"
-            appendEvent(uid: notice.uid, kind: "video-hold-send-failed", detail: "\(error.localizedDescription); no courtesy retry; final work continues")
-        }
-        // Do not advance answered cursors or set any original message's reply receipt.
-        try persist(sendCritical: true)
-        return true
-    }
-
-    private func videoHoldCapture(for notice: PDDVideoHoldingNotice) -> AutoReplyCapture? {
-        let captures = state.pendingVideoBatches.filter { $0.uid == notice.uid }.map(\.capture)
-            + state.jobs.filter { $0.uid == notice.uid && [.queued, .generating, .ready].contains($0.state) }.map(\.capture)
-        return captures.filter { notice.messageIDs.isSubset(of: Set($0.fullHistory.map(\.id))) }
-            .max { $0.customerCursor.count < $1.customerCursor.count }
-    }
-
     private func coalesceQueuedVideoReplies() {
         let videoIDs = state.jobs.filter { $0.state == .queued && !$0.capture.videoAttachments.isEmpty }.map(\.id)
         for videoID in videoIDs {
@@ -2127,7 +2025,8 @@ final class AutoReplyScheduler: ObservableObject {
                     capture: capture, expectedMessageIDs: expected,
                     completedAttachmentsByMessageID: pending.completedAttachmentsByMessageID.filter { !terminal.contains($0.key) },
                     failedMessageIDs: pending.failedMessageIDs.subtracting(terminal),
-                    duplicateMessageIDs: pending.duplicateMessageIDs.subtracting(terminal), createdAt: pending.createdAt)
+                    duplicateMessageIDs: pending.duplicateMessageIDs.subtracting(terminal),
+                    allowsIndependentText: pending.allowsIndependentText, createdAt: pending.createdAt)
                 state.pendingVideoBatches.append(retained)
                 let resolved = Set(retained.completedAttachmentsByMessageID.keys)
                     .union(retained.failedMessageIDs).union(retained.duplicateMessageIDs)
@@ -2149,6 +2048,7 @@ final class AutoReplyScheduler: ObservableObject {
         liveGenerationJobIDs.remove(jobID)
         guard let index = state.jobs.firstIndex(where: { $0.id == jobID }),
               state.jobs[index].state == .generating else { return }
+        var terminalHostedCode: String?
         switch result {
         case .success(let generated):
             state.jobs[index].reply = CustomerFacingReplyPolicy.preparedForPinduoduo(generated.reply)
@@ -2199,7 +2099,7 @@ final class AutoReplyScheduler: ObservableObject {
                     state.jobs[index].deliveryOutcome = .notSent
                     state.jobs[index].nextAttemptAt = nil
                     if case .jobFailed(let code, _) = hostedError {
-                        _ = enqueueHostedFailureTransfer(at: index, code: code)
+                        terminalHostedCode = code
                     }
                 }
                 break
@@ -2255,6 +2155,7 @@ final class AutoReplyScheduler: ObservableObject {
             }
         }
         recoverHostedTimestampConflicts()
+        if let terminalHostedCode { _ = enqueueHostedFailureTransfer(at: index, code: terminalHostedCode) }
         syncJobs()
         do {
             // A generated reply is never eligible for delivery until the exact
@@ -2405,19 +2306,6 @@ final class AutoReplyScheduler: ObservableObject {
         catch {
             appendEvent(uid: uid, kind: "discovery-capture-ack-deferred", detail: error.localizedDescription)
         }
-        let capturedVideoIDs = Set(
-            rawCapture.batch?.events.filter { $0.kind == .video }.map(\.messageID) ?? []
-        )
-        let recentVideoIDs = recentVideoMessageIDs(in: rawCapture, candidates: capturedVideoIDs)
-        let staleVideoIDs = capturedVideoIDs.subtracting(recentVideoIDs)
-        if !staleVideoIDs.isEmpty {
-            appendEvent(
-                uid: uid,
-                kind: "video-hold-stale-skipped",
-                detail: "message_ids=\(staleVideoIDs.sorted().joined(separator: ",")); no courtesy timer for history older than 120s"
-            )
-        }
-        registerVideoHold(uid: uid, messageIDs: recentVideoIDs)
         appendEvent(uid: uid, kind: "customer-messages-captured",
             detail: "message_ids=\((rawCapture.batch?.customerMessageIDs ?? []).sorted().joined(separator: ","))")
         try reconcileVisibleReplies(in: rawCapture, uid: uid)
@@ -2488,7 +2376,7 @@ final class AutoReplyScheduler: ObservableObject {
         latestCapture = capture
         if request.kind != .videoRecovery, let batch = capture.batch, batch.incomingHandoffKey == nil,
            !batch.events.isEmpty, batch.events.allSatisfy({ $0.kind == .text }),
-           let pendingIndex = state.pendingVideoBatches.firstIndex(where: { $0.uid == uid }),
+           let pendingIndex = state.pendingVideoBatches.firstIndex(where: { $0.uid == uid && !$0.allowsIndependentText }),
            batch.customerMessageIDs.isDisjoint(with: Set(state.pendingVideoBatches[pendingIndex].expectedMessageIDs)),
            let joined = PDDVideoReplyBatch.joining([state.pendingVideoBatches[pendingIndex].capture, capture]) {
             state.pendingVideoBatches[pendingIndex].capture = joined
@@ -2616,14 +2504,26 @@ final class AutoReplyScheduler: ObservableObject {
             try persist()
             return
         }
+        enqueueReply(for: capture)
+        syncJobs()
+        try persist()
+    }
+
+    private func enqueueReply(for capture: AutoReplyCapture) {
+        let videoOnly = capture.batch.map { batch in
+            !batch.events.isEmpty && batch.events.allSatisfy { $0.kind == .video }
+        } ?? false
+        let fallback = videoOnly && capture.videoAttachments.isEmpty
+            ? CustomerFacingFallback.productProblemQuestion(history: capture.fullHistory)
+            : nil
         state.nextSequence += 1
         state.jobs.append(AutoReplyJob(
             id: UUID(),
-            uid: uid,
+            uid: capture.uid,
             sequence: state.nextSequence,
-            state: .queued,
+            state: fallback == nil ? .queued : .ready,
             capture: capture,
-            reply: nil,
+            reply: fallback,
             deliveryOutcome: nil,
             confirmedServiceMessageID: nil,
             retries: 0,
@@ -2632,8 +2532,6 @@ final class AutoReplyScheduler: ObservableObject {
             imageAttachments: capture.imageAttachments,
             videoAttachments: capture.videoAttachments
         ))
-        syncJobs()
-        try persist()
     }
 
     private func requeueVideoRecoveryIfNeeded(_ request: AutoReplyCaptureRequest) {
@@ -2946,6 +2844,23 @@ final class AutoReplyScheduler: ObservableObject {
 
     private func hasActiveJob(uid: String) -> Bool {
         activeJobIndex(uid: uid) != nil
+    }
+
+    private func releaseTextFromRetryingVideoBatch(at index: Int) {
+        state.pendingVideoBatches[index].allowsIndependentText = true
+        let capture = state.pendingVideoBatches[index].capture
+        guard let batch = capture.batch, batch.incomingHandoffKey == nil else { return }
+        let textIDs = Set(batch.events.filter { $0.kind == .text }.map(\.messageID))
+        guard !textIDs.isEmpty,
+              let retained = captureByRemovingMessages(capture, messageIDs: textIDs),
+              let text = captureByRemovingMessages(capture, messageIDs: batch.customerMessageIDs.subtracting(textIDs))
+        else { return }
+        state.pendingVideoBatches[index].capture = retained
+        if let uncovered = captureByRemovingMessages(text, messageIDs: coveredMessageIDs(uid: capture.uid)) {
+            enqueueReply(for: uncovered)
+            appendEvent(uid: capture.uid, kind: "video-retry-text-released",
+                detail: "message_ids=\((uncovered.batch?.customerMessageIDs ?? []).sorted().joined(separator: ","))")
+        }
     }
 
     private func promotePendingVideoBatch(at index: Int) {
@@ -3432,7 +3347,7 @@ final class AutoReplyScheduler: ObservableObject {
 
     private func enqueueHostedFailureTransfer(at index: Int, code: String) -> Bool {
         let job = state.jobs[index]
-        guard ["CODEX_FAILED", "EPERM"].contains(code), !job.sendWasInvoked,
+        guard job.state == .quarantined, ["CODEX_FAILED", "EPERM", "MESSAGE_ID_CONFLICT"].contains(code), !job.sendWasInvoked,
               job.deliveryOutcome == .notSent, let batch = job.capture.batch,
               batch.incomingHandoffKey == nil, !batch.customerMessageIDs.isEmpty,
               !PDDConversationIdentityStore.isSharedVisitorUID(job.uid),

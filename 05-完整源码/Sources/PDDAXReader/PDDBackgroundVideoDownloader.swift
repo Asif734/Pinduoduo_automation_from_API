@@ -1,10 +1,12 @@
 import Foundation
 
 enum PDDUnlimitedVideoDownloadSessionPolicy {
+    static let transferTimeoutSeconds = 30
+
     static func makeConfiguration() -> URLSessionConfiguration {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 5
-        configuration.timeoutIntervalForResource = 15
+        configuration.timeoutIntervalForResource = TimeInterval(transferTimeoutSeconds)
         configuration.waitsForConnectivity = false
         configuration.urlCache = nil
         configuration.httpCookieStorage = nil

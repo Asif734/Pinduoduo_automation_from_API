@@ -17,14 +17,16 @@ final class PDDVideoCacheProbeTests: XCTestCase {
     func testExtractsOnlySignedPDDHTTPSMP4WithVideoMIME() throws {
         let valid = Data("https://video3.yangkeduo.com/path/a.mp4?sign=secret\ncontent-type: video/mp4".utf8)
         let invalidHost = Data("https://evil.example/a.mp4\ncontent-type: video/mp4".utf8)
+        let lookalike = Data("https://video3.pddpic.com.evil.example/a.mp4\ncontent-type: video/mp4".utf8)
         let invalidMIME = Data("https://video3.yangkeduo.com/a.mp4\ncontent-type: text/html".utf8)
 
         XCTAssertEqual(PDDVideoCacheMetadata.extractCandidate(from: valid)?.host, "video3.yangkeduo.com")
         XCTAssertNil(PDDVideoCacheMetadata.extractCandidate(from: invalidHost))
+        XCTAssertNil(PDDVideoCacheMetadata.extractCandidate(from: lookalike))
         XCTAssertNil(PDDVideoCacheMetadata.extractCandidate(from: invalidMIME))
     }
 
-    func testWatcherFindsChangedEntryAcrossProfiles() async throws {
+    func testWatcherFindsPDDPicVideoAfterPreviewChangesAnotherCacheProfile() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let first = root.appendingPathComponent("first")
         let second = root.appendingPathComponent("second")
@@ -35,14 +37,14 @@ final class PDDVideoCacheProbeTests: XCTestCase {
 
         Task {
             try await Task.sleep(for: .milliseconds(30))
-            try Data("https://video1.pddcdn.com/new.mp4?token=x\ncontent-type:video/mp4".utf8)
+            try Data("https://video3.pddpic.com/new.mp4?token=x\ncontent-type:video/mp4".utf8)
                 .write(to: second.appendingPathComponent("entry_0"))
             try Data([0, 1, 2, 3]).write(to: second.appendingPathComponent("entry_s"))
         }
         let result = try await PDDVideoCacheWatcher(pollInterval: .milliseconds(5))
             .waitForNewCandidate(in: baselines, timeout: .seconds(1))
 
-        XCTAssertEqual(result.host, "video1.pddcdn.com")
+        XCTAssertEqual(result.host, "video3.pddpic.com")
         XCTAssertEqual(result.path, "/new.mp4")
     }
 

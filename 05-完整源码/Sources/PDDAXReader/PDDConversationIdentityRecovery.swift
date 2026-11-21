@@ -3,14 +3,23 @@ import Foundation
 /// Repairs work records using exact message/boundary proofs, never a folder-wide name merge.
 enum PDDConversationIdentityRecovery {
     static func currentThreadCapture(canonicalUID: String, after cursor: AutoReplyCursor,
-                                     jobs: [AutoReplyJob], root: URL, covered: Set<String> = []) throws -> AutoReplyCapture? {
-        let history = try PerUserChatStore(rootDirectory: root).loadAXFirst(uid: canonicalUID)
+                                     jobs: [AutoReplyJob], root: URL, covered: Set<String> = [],
+                                     knownJobs: [AutoReplyJob] = []) throws -> AutoReplyCapture? {
+        let store = PerUserChatStore(rootDirectory: root)
+        let original = try store.loadAXFirst(uid: canonicalUID)
+        var history = original
         let ids = Set(history.filter { $0.sender == .customer }.map(\.id))
         let proof = try PDDConversationIdentityStore(root: root).repairProof(uid: canonicalUID)
         guard !proof.isEmpty, proof.isSubset(of: ids),
               jobs.allSatisfy({ $0.capture.batch?.incomingHandoffKey == nil }) else { return nil }
-        let timeline = try AutoReplyTimeline.make(messages: history)
-        guard timeline.validatesPrefix(cursor) else { return nil }
+        var timeline = try AutoReplyTimeline.make(messages: history)
+        if !timeline.validatesPrefix(cursor) {
+            guard let confirmed = try confirmedHistory(uid: canonicalUID, cursor: cursor, jobs: knownJobs, root: root),
+                  let restored = restoreAnsweredTextOrder(in: history, from: confirmed, count: cursor.count) else { return nil }
+            history = restored
+            timeline = try AutoReplyTimeline.make(messages: history)
+            guard timeline.validatesPrefix(cursor) else { return nil }
+        }
         let targets = jobs.reduce(into: Set<String>()) {
             $0.formUnion($1.capture.batch?.customerMessageIDs ?? [])
             $0.formUnion($1.pendingSupplement?.batch?.customerMessageIDs ?? [])
@@ -26,6 +35,11 @@ enum PDDConversationIdentityRecovery {
                 ? event : nil
         }
         guard !events.isEmpty else { return nil }
+        if history != original {
+            guard try store.restoreAXFirstTextOrder(uid: canonicalUID, expected: original, restored: history) else { return nil }
+            AutomationStepLog.record(root: root, uid: canonicalUID, step: "identity-recovery-answered-text-restored",
+                detail: "Verified archived customer text against the saved answered cursor; cursor preserved")
+        }
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         let filtered = FrozenCustomerBatch(startCursor: cursor, endCursor: timeline.cursor, events: events,
             targetCustomerJSONL: try events.map { String(decoding: try encoder.encode($0), as: UTF8.self) }.joined(separator: "\n"))
@@ -38,6 +52,47 @@ enum PDDConversationIdentityRecovery {
             imageAttachments: images.values.filter { filtered.customerMessageIDs.contains($0.messageID) }.sorted { $0.messageID < $1.messageID },
             videoAttachments: videos.values.filter { filtered.customerMessageIDs.contains($0.messageID) }.sorted { $0.messageID < $1.messageID },
             pendingVideoMessageIDs: Array(Set(captures.flatMap(\.pendingVideoMessageIDs)).intersection(filtered.customerMessageIDs)).sorted())
+    }
+
+    private static func confirmedHistory(uid: String, cursor: AutoReplyCursor,
+                                         jobs: [AutoReplyJob], root: URL) throws -> [PDDChatMessage]? {
+        guard cursor.count > 0 else { return nil }
+        func isConfirmed(_ job: AutoReplyJob) -> Bool {
+            job.uid == uid && job.capture.uid == uid && job.state == .completed && job.deliveryOutcome == .sent
+                && job.confirmedServiceMessageID != nil && job.capture.batch?.endCursor == cursor
+        }
+        if let job = jobs.last(where: isConfirmed) { return job.capture.fullHistory }
+
+        // A quiet customer's last answered turn can age out of the active snapshot.
+        let directory = root.appendingPathComponent("archive/records", isDirectory: true)
+        guard FileManager.default.fileExists(atPath: directory.path) else { return nil }
+        let records = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles])
+        let decoder = JSONDecoder()
+        for record in records where record.pathExtension == "json" {
+            guard let data = try? Data(contentsOf: record), let job = try? decoder.decode(AutoReplyJob.self, from: data),
+                  isConfirmed(job) else { continue }
+            return job.capture.fullHistory
+        }
+        return nil
+    }
+
+    private static func restoreAnsweredTextOrder(in history: [PDDChatMessage], from confirmed: [PDDChatMessage],
+                                                 count: Int) -> [PDDChatMessage]? {
+        let prior = Array(confirmed.lazy.filter { $0.sender == .customer }.prefix(count))
+        let current = history.indices.filter { history[$0].sender == .customer }.prefix(count)
+        guard prior.count == count, current.count == count else { return nil }
+        var repaired = history
+        for (index, previous) in zip(current, prior) {
+            let message = history[index]
+            guard message.id == previous.id, message.kind == previous.kind,
+                  message.displayTime == previous.displayTime else { return nil }
+            if message.content == previous.content { continue }
+            guard message.kind == .text, PDDMessageBodyText.sameAXTextFragments(message.content, previous.content) else { return nil }
+            repaired[index] = .init(id: message.id, sender: .customer, content: previous.content,
+                displayTime: message.displayTime, kind: message.kind, capturedAt: message.capturedAt)
+        }
+        return repaired
     }
 
     @discardableResult

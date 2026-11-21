@@ -4,6 +4,28 @@ import XCTest
 @testable import PDDAXReader
 
 final class PinduoduoV2IntegrationTests: XCTestCase {
+    func testNewBatchIncludesOnlyLast48HoursOfContextAndPreservesExplicitTargets() throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let now = Date(timeIntervalSince1970: 1_780_000_000)
+        let cutoff = now.addingTimeInterval(-48 * 60 * 60)
+        let expired = PDDChatMessage(id: "expired-context", sender: .service, content: "Earlier reply",
+            displayTime: nil, kind: .text, capturedAt: cutoff.addingTimeInterval(-1))
+        let recent = PDDChatMessage(id: "recent-context", sender: .service, content: "Current setup",
+            displayTime: nil, kind: .text, capturedAt: cutoff)
+        let oldTarget = PDDChatMessage(id: "unanswered-target", sender: .customer, content: "Please help",
+            displayTime: nil, kind: .text, capturedAt: cutoff.addingTimeInterval(-3))
+        let current = PDDChatMessage(id: "new-target", sender: .customer, content: "How do I connect it?",
+            displayTime: nil, kind: .text, capturedAt: now)
+        let capture = try makeCapture(uid: "two-day-context", messages: [oldTarget, expired, recent, current],
+            targets: [oldTarget.id, current.id])
+        let frozen = try PinduoduoV2RequestBuilder(rootDirectory: root, now: { now })
+            .freeze(localJobID: UUID(), capture: capture)
+        let request = try JSONDecoder().decode(PinduoduoV2ReplyRequest.self, from: frozen.requestJSON)
+        XCTAssertEqual(request.messages.map(\.id), [oldTarget.id, recent.id, current.id])
+        XCTAssertEqual(Set(request.targetMessageIds), [oldTarget.id, current.id])
+    }
+
     func testEveryNewFrozenRequestIncludesWordingPolicyBeforeGeneration() throws {
         let root = temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
         let capture = try makeCapture(uid: "customer", messages: [message("q", .customer, "转亭子", seconds: 0)], targets: ["q"])
@@ -20,6 +42,27 @@ final class PinduoduoV2IntegrationTests: XCTestCase {
             instructionsProvider: FixedV2Instructions(value: "Different policy after submission"))
             .freeze(localJobID: id, capture: capture)
         XCTAssertEqual(repeated.requestJSON, record.requestJSON)
+    }
+
+    func testBundledMerchantPolicyReachesHostedRequestsWithExamplesAndFitsLimit() throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        let policy = project.appendingPathComponent("Resources/CustomerService/pinduoduo-v2-reply-instructions.txt")
+        let builder = PinduoduoV2RequestBuilder(rootDirectory: root,
+            instructionsProvider: PinduoduoV2ReplyInstructionsFileProvider(candidates: [policy]))
+        let capture = try makeCapture(uid: "merchant-policy", messages: [
+            message("q", .customer, "找不到速印通", seconds: 0)
+        ], targets: ["q"])
+        let record = try builder.freeze(localJobID: UUID(), capture: capture)
+        let request = try JSONDecoder().decode(PinduoduoV2ReplyRequest.self, from: record.requestJSON)
+
+        XCTAssertTrue(request.replyInstructions.contains("如果调整后问题仍然存在，请先暂停试打。"))
+        XCTAssertTrue(request.replyInstructions.contains("请问您之前是从哪里下载安装包的？我们先确认来源，再继续安装。"))
+        XCTAssertTrue(request.replyInstructions.contains("Keep contact and payments within Pinduoduo"))
+        XCTAssertTrue(request.replyInstructions.contains("Never tie money, coupons, gifts, or other benefits to a review"))
+        XCTAssertLessThanOrEqual(request.replyInstructions.utf8.count, 16_384)
     }
 
     func testGenerationFinishesObservedIdentityRepliesAsNeutralHelpWithoutParking() async throws {
@@ -210,6 +253,32 @@ final class PinduoduoV2IntegrationTests: XCTestCase {
             XCTAssertEqual(accepted.jobId, "hosted")
             XCTAssertEqual(accepted.status, status)
         }
+    }
+
+    func testPendingVideoCanUploadFirstFramesAfterAnEarlierTextRequest() throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let frame = root.appendingPathComponent("frame.jpg")
+        try Data([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3]).write(to: frame)
+        let video = PDDChatMessage(id: "pending-video", sender: .customer, content: "[视频]",
+            displayTime: nil, kind: .video, capturedAt: Date().addingTimeInterval(-10))
+        let question = message("question", .customer, "The printer feeds blank paper", seconds: 0)
+        let builder = PinduoduoV2RequestBuilder(rootDirectory: root)
+        let history = [video, question]
+        let textCapture = try makeCapture(uid: "late-frames", messages: history, targets: [question.id])
+        let first = try builder.freeze(localJobID: UUID(), capture: textCapture)
+        let textRequest = try JSONDecoder().decode(PinduoduoV2ReplyRequest.self, from: first.requestJSON)
+        XCTAssertEqual(textRequest.messages.map(\.id), [question.id])
+        try PinduoduoV2HistoryLedger(rootDirectory: root, customerUID: textCapture.uid)
+            .markAccepted(messages: first.messageFingerprints, media: first.mediaFingerprints)
+
+        var videoCapture = try makeCapture(uid: textCapture.uid, messages: history, targets: [video.id])
+        videoCapture.videoAttachments = [speechVideo(video.id, frame: frame)]
+        let second = try builder.freeze(localJobID: UUID(), capture: videoCapture)
+        let videoRequest = try JSONDecoder().decode(PinduoduoV2ReplyRequest.self, from: second.requestJSON)
+        XCTAssertEqual(videoRequest.targetMessageIds, [video.id])
+        XCTAssertEqual(videoRequest.media.map(\.messageId), [video.id])
+        XCTAssertEqual(videoRequest.messages[0].mediaIds, videoRequest.media.map(\.id))
     }
 
     func testVideoSpeechTravelsBesideFramesWithOriginalMessageBinding() throws {

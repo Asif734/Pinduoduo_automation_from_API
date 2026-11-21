@@ -345,6 +345,59 @@ final class PDDConversationIdentityTests: XCTestCase {
         XCTAssertEqual(generated.map { $0.batch?.events.map(\.messageID) }, [[old.id, newest.id]])
     }
 
+    func testAliasRecoveryRestoresVerifiedAnsweredTextOrderAndQueuesOneReply() throws {
+        let root = temporary(); defer { try? FileManager.default.removeItem(at: root) }
+        let canonical = PDDConversationKey.make(locator: .init(nickname: "A***"))
+        let alias = PDDConversationKey.make(locator: .init(nickname: "A**"))
+        let answered = message("old", "Line A\nLine B\nLine C")
+        let reordered = message(answered.id, "Line B\nLine C\nLine A")
+        let first = message("first", "unanswered question")
+        let followup = message("next", "follow-up question")
+        let answeredTimeline = try AutoReplyTimeline.make(messages: [answered])
+        let cursor = answeredTimeline.cursor
+        let store = AutoReplyStore(rootDirectory: root)
+        let chat = PerUserChatStore(rootDirectory: root)
+        func job(_ uid: String, _ messages: [PDDChatMessage], _ sequence: Int,
+                 _ state: AutoReplyJobState, sent: Bool = false) throws -> AutoReplyJob {
+            let timeline = try AutoReplyTimeline.make(messages: messages)
+            let capture = AutoReplyCapture(uid: uid, fullHistory: messages, batch: try timeline.freeze(after: .empty),
+                customerCursor: timeline.cursor, unexpectedServiceMessageIDs: [])
+            return .init(id: UUID(), uid: uid, sequence: sequence, state: state, capture: capture,
+                reply: sent || state == .ready ? "reply" : nil, deliveryOutcome: sent ? .sent : nil,
+                confirmedServiceMessageID: sent ? "sent-earlier" : nil, retries: 0, nextAttemptAt: nil,
+                lastError: nil, sendWasInvoked: sent)
+        }
+        let confirmed = try job(canonical, [answered], 1, .completed, sent: true)
+        try AutoReplyTransactionalStore(rootDirectory: root).archiveTerminal(confirmed)
+        let firstJob = try job(alias, [first], 2, .ready)
+        let secondJob = try job(canonical, [first, followup], 3, .queued)
+        let registry = PDDConversationIdentityStore(root: root)
+        try registry.remember(uid: canonical, messageIDs: [answered.id, followup.id], stableID: nil, boundary: nil)
+        try registry.remember(uid: alias, messageIDs: [first.id], stableID: nil, boundary: nil)
+        _ = try registry.reconcileVerifiedThread(messageIDs: [answered.id, first.id, followup.id], stableID: nil, boundary: nil)
+        _ = try chat.mergeAXFirst(uid: canonical, messages: [message(answered.id, "actually changed"), first, followup])
+        XCTAssertNil(try PDDConversationIdentityRecovery.currentThreadCapture(canonicalUID: canonical,
+            after: cursor, jobs: [firstJob, secondJob], root: root))
+        _ = try chat.mergeAXFirst(uid: canonical, messages: [reordered])
+
+        var state = AutoReplyPersistentState()
+        state.jobs = [firstJob, secondJob]; state.nextSequence = 3; state.answeredCursors[canonical] = cursor
+        try store.save(state)
+        let driver = SchedulerDriver()
+        let scheduler = try AutoReplyScheduler(driver: driver, generator: Generator(), store: store)
+        try scheduler.reconcileVisibleIdentity(in: tree("A***", ids: []))
+        let recovered = try XCTUnwrap(scheduler.jobs.first { $0.sequence == 4 })
+        XCTAssertEqual(recovered.uid, canonical)
+        XCTAssertEqual(recovered.state, .queued)
+        XCTAssertEqual(recovered.capture.batch?.events.map(\.messageID), [first.id, followup.id])
+        XCTAssertEqual(recovered.capture.batch?.startCursor, cursor)
+        XCTAssertEqual(try store.load().answeredCursors[canonical], cursor)
+        XCTAssertEqual(Array(scheduler.jobs.prefix(2)).map(\.deliveryOutcome), [.notSent, .notSent])
+        XCTAssertTrue(driver.sentUIDs.isEmpty)
+        _ = try chat.mergeAXFirst(uid: canonical, messages: [reordered])
+        XCTAssertEqual(try chat.loadAXFirst(uid: canonical).first?.content, answered.content)
+    }
+
     func testAliasRecoveryRebuildsKnownUnsentTargetWhenNoNewMessagesFollowCursor() throws {
         let root = temporary(); defer { try? FileManager.default.removeItem(at: root) }
         let canonical = PDDConversationKey.make(locator: .init(nickname: "A***"))

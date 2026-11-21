@@ -33,8 +33,9 @@ enum PDDVideoTransferFailureCategory: String, Codable, Equatable, Sendable {
     case legacyUnknown
 
     static func classify(_ error: Error) -> Self {
-        if let timeout = error as? OperationTimeout, timeout.stage == "video-address" {
-            return .addressUnavailable
+        if let timeout = error as? OperationTimeout {
+            if timeout.stage == "video-address" { return .addressUnavailable }
+            if timeout.stage == "video-download" { return .responseTimeout }
         }
         if let error = error as? PDDCustomerVideoError {
             switch error {

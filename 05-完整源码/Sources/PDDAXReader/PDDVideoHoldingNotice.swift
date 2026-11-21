@@ -1,14 +1,8 @@
 import Foundation
 
-/// A courtesy message is separate from capture/model/final-reply receipts.
+/// Retained so checkpoints written before removal of the courtesy timer still load.
 struct PDDVideoHoldingNotice: Codable, Equatable, Sendable, Identifiable {
-    static let messages = [
-        "视频已收到，请稍等，我这边查看一下。",
-        "收到您发的视频了，麻烦稍等片刻，我看一下具体情况。",
-        "感谢您提供视频，请稍等，我查看后继续为您解答。",
-        "请稍等一下，我这边正在查看您发的视频。",
-        "您的视频已收到，请给我一点时间查看里面的细节。"
-    ]
+    static let message = "请稍等一下。方便的话，也可以补充描述一下具体情况。"
     let id: UUID
     var uid: String
     var messageIDs: Set<String>
@@ -21,7 +15,7 @@ struct PDDVideoHoldingNotice: Codable, Equatable, Sendable, Identifiable {
 
     init(uid: String, messageIDs: Set<String>, capturedAt: Date) {
         id = UUID(); self.uid = uid; self.messageIDs = messageIDs
-        self.capturedAt = capturedAt; text = Self.messages.randomElement()!
+        self.capturedAt = capturedAt; text = Self.message
     }
 }
 

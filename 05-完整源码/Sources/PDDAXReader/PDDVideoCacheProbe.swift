@@ -59,7 +59,7 @@ enum PDDVideoHostPolicy {
         guard let host = host?.lowercased() else { return false }
         let labels = host.split(separator: ".")
         return labels.count >= 3 && labels[0].hasPrefix("video")
-            && (host.hasSuffix(".yangkeduo.com") || host.hasSuffix(".pddcdn.com"))
+            && [".yangkeduo.com", ".pddcdn.com", ".pddpic.com"].contains(where: host.hasSuffix)
     }
 }
 

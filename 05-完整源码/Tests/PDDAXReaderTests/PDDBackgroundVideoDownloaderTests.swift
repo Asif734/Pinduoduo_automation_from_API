@@ -22,11 +22,11 @@ final class PDDBackgroundVideoDownloaderTests: XCTestCase {
         }
     }
 
-    func testSessionPolicyUsesCurrentQianniuBoundedAttemptWithoutBrowserState() {
+    func testSessionPolicyAllowsLargeVideoTransferWithoutWaitingForDeadConnections() {
         let configuration = PDDUnlimitedVideoDownloadSessionPolicy.makeConfiguration()
 
         XCTAssertEqual(configuration.timeoutIntervalForRequest, 5)
-        XCTAssertEqual(configuration.timeoutIntervalForResource, 15)
+        XCTAssertEqual(configuration.timeoutIntervalForResource, 30)
         XCTAssertFalse(configuration.waitsForConnectivity)
         XCTAssertNil(configuration.urlCache)
         XCTAssertNil(configuration.httpCookieStorage)

@@ -124,6 +124,13 @@ struct PerUserChatStore {
         )
     }
 
+    /// The caller has verified the replacement against the saved answered cursor.
+    func restoreAXFirstTextOrder(uid: String, expected: [PDDChatMessage], restored: [PDDChatMessage]) throws -> Bool {
+        guard try loadAXFirst(uid: uid) == expected else { return false }
+        _ = try persist(uid: uid, history: restored, insertedCount: 0, fileName: "history-ax-first.jsonl")
+        return true
+    }
+
     func mergeOCRAuthoritative(uid: String, messages: [PDDChatMessage]) throws -> ChatMergeResult {
         let existingOCR = try load(uid: uid).filter {
             ($0.id.hasPrefix("ocr-") && !PDDOCRChatParser.isKnownPlatformNoiseText($0.content))
@@ -215,6 +222,11 @@ struct PerUserChatStore {
         for message in messages {
             if let index = indexes[message.id] {
                 let previous = merged[index]
+                if fileName == "history-ax-first.jsonl", previous.sender == .customer, message.sender == .customer,
+                   previous.kind == .text, message.kind == .text, previous.content != message.content,
+                   PDDMessageBodyText.sameAXTextFragments(previous.content, message.content) {
+                    continue // AX can change fragment order on each read.
+                }
                 if previous.sender != message.sender
                     || previous.content != message.content
                     || previous.kind != message.kind {

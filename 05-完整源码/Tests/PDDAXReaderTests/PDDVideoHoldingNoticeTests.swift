@@ -3,6 +3,27 @@ import XCTest
 
 @MainActor
 final class PDDVideoHoldingNoticeTests: XCTestCase {
+    func testVideoFailureBeforeCaptureIsRecordedStillAsksAboutProblem() async throws {
+        let f = try Fixture(pending: true); defer { f.clean() }
+        for phase in [PDDVideoTransferPhase.failed, .fallbackRequired] {
+            await f.scheduler.receiveVideoTransferEvent(.init(uid: "customer", messageID: "video", phase: phase))
+        }
+        await f.capture()
+        await f.ticks(10)
+        XCTAssertEqual(f.driver.sent, ["请问您的产品遇到了什么问题？麻烦您描述一下具体表现，我来帮您排查。"])
+        XCTAssertTrue(f.scheduler.pendingVideoBatchesSnapshot.isEmpty)
+    }
+
+    func testVideoWithoutClickablePreviewAsksAboutProblemWithoutGeneration() async throws {
+        let f = try Fixture(pending: true); defer { f.clean() }
+        f.driver.captures["customer"] = try holdCapture(messages: [holdMessage("video", .video, "[视频]")])
+        await f.capture()
+        await f.ticks(10)
+        let captures = await f.generator.captures
+        XCTAssertTrue(captures.isEmpty)
+        XCTAssertEqual(f.driver.sent, ["请问您的产品遇到了什么问题？麻烦您描述一下具体表现，我来帮您排查。"])
+    }
+
     func testFailedVideoAsksProductProblemOnceThenWaitsForCustomerAcrossRestart() async throws {
         let f = try Fixture(pending: true); defer { f.clean() }
         await f.capture()
@@ -56,76 +77,90 @@ final class PDDVideoHoldingNoticeTests: XCTestCase {
         )
     }
 
-    func testNoticeWithoutCapturedTargetCannotBlockAnotherCustomersDueNotice() async throws {
-        let f = try Fixture(pending: true); defer { f.clean() }
-        await f.scheduler.receiveVideoTransferEvent(.init(uid: "missing-customer", messageID: "missing-video", phase: .waitingForAddress))
-        await f.capture(); f.clock.value += 10
-        await f.ticks(3)
-        XCTAssertEqual(f.driver.sentUIDs, ["customer"])
-    }
-
-    func testHoldingMessageAlsoSendsWhileModelIsGenerating() async throws {
+    func testVideoGenerationSendsNoCourtesyMessageAfterTenSeconds() async throws {
         let f = try Fixture(pending: false); defer { f.clean() }
         await f.generator.setSlow()
         await f.capture(); await f.ticks(2)
         XCTAssertEqual(f.scheduler.jobs.first?.state, .generating)
         f.clock.value += 10; await f.ticks(2)
-        XCTAssertEqual(f.driver.sent.count, 1)
-        XCTAssertTrue(PDDVideoHoldingNotice.messages.contains(f.driver.sent[0]))
+        XCTAssertTrue(f.driver.sent.isEmpty)
         XCTAssertEqual(f.scheduler.jobs.first?.state, .generating)
         XCTAssertNil(try CustomerMessageReceipts(root: f.root).receipts(uid: "customer")["video"]?.replySentAt)
     }
-    func testTenSecondChineseNoticeDoesNotCompleteVideoAndFinalReplyStillSends() async throws {
+    func testVideoAwaitingEvidenceSendsOnlyTheFinalReply() async throws {
         let f = try Fixture(pending: true); defer { f.clean() }
         await f.capture()
         f.clock.value += 9.99; await f.ticks(3)
         XCTAssertTrue(f.driver.sent.isEmpty)
         f.clock.value += 0.01; await f.ticks(3)
-        XCTAssertEqual(f.driver.sent.count, 1)
-        XCTAssertTrue(PDDVideoHoldingNotice.messages.contains(f.driver.sent[0]))
+        XCTAssertTrue(f.driver.sent.isEmpty)
         let receipt = try CustomerMessageReceipts(root: f.root).receipts(uid: "customer")["video"]
         XCTAssertNil(receipt?.replySentAt); XCTAssertNil(receipt?.submittedAt)
         XCTAssertEqual(f.scheduler.pendingVideoBatchesSnapshot.count, 1)
         f.clock.value += 20; await f.ticks(5)
-        XCTAssertEqual(f.driver.sent.count, 1)
+        XCTAssertTrue(f.driver.sent.isEmpty)
         await f.scheduler.receiveVideoTransferEvent(.init(uid: "customer", messageID: "video", phase: .readyForGeneration, attachment: holdAttachment()))
         await f.ticks(15)
-        XCTAssertEqual(f.driver.sent.count, 2)
-        XCTAssertEqual(f.driver.sent.last, "实际答复")
+        XCTAssertEqual(f.driver.sent, ["实际答复"])
         XCTAssertNotNil(try CustomerMessageReceipts(root: f.root).receipts(uid: "customer")["video"]?.replySentAt)
     }
 
-    func testFastFinalReplyCancelsHoldAndStopAndDryRunDoNotSend() async throws {
+    func testFastFinalReplySendsOnceAndDryRunDoesNotSend() async throws {
         let f = try Fixture(pending: false); defer { f.clean() }
         await f.capture(); await f.ticks(15)
         XCTAssertEqual(f.driver.sent, ["实际答复"])
         f.clock.value += 20; await f.ticks(5)
         XCTAssertEqual(f.driver.sent, ["实际答复"])
-        let dry = try Fixture(pending: true); defer { dry.clean() }
-        await dry.capture(); dry.scheduler.setDeliveryEnabled(false)
+        let dry = try Fixture(pending: false); defer { dry.clean() }
+        dry.scheduler.setDeliveryEnabled(false)
+        await dry.capture()
         dry.clock.value += 11; await dry.ticks(5)
         XCTAssertTrue(dry.driver.sent.isEmpty)
         dry.scheduler.stop(); dry.scheduler.setDeliveryEnabled(true); await dry.ticks(3)
         XCTAssertTrue(dry.driver.sent.isEmpty)
     }
 
-    func testAttemptSurvivesRestartAndUncertainHoldDoesNotRepeatOrBlockAnotherCustomer() async throws {
+    func testLegacyCourtesyDoesNotSendOrBlockAnotherCustomerAfterRestart() async throws {
         let f = try Fixture(pending: true); defer { f.clean() }
-        await f.capture(); f.driver.result = .uncertain("confirmation unavailable")
-        f.clock.value += 10; await f.ticks(3)
-        XCTAssertEqual(f.driver.sent.count, 1)
+        await f.capture()
         f.scheduler.stop()
-        let restored = try AutoReplyScheduler(driver: f.driver, generator: f.generator, store: AutoReplyStore(rootDirectory: f.root), now: { f.clock.value })
+        let store = AutoReplyStore(rootDirectory: f.root)
+        var checkpoint = try store.load()
+        checkpoint.videoHoldingNotices = [.init(uid: "customer", messageIDs: ["video"], capturedAt: f.clock.value)]
+        try store.save(checkpoint)
+        let restored = try AutoReplyScheduler(driver: f.driver, generator: f.generator, store: store, now: { f.clock.value })
         restored.start(); f.clock.value += 20
+        defer { restored.stop() }
         await restored.tick(); await restored.tick()
-        XCTAssertEqual(f.driver.sent.count, 1)
-        f.driver.result = nil
+        XCTAssertTrue(f.driver.sent.isEmpty)
         f.driver.captures["other"] = try holdCapture(uid: "other", messages: [holdMessage("other-text", .text, "hello")])
         f.driver.discoveries = [.init(uid: "other", hasUnreadEvidence: true)]
         restored.requestAXRefresh()
         for _ in 0..<20 { await restored.tick(); try await Task.sleep(for: .milliseconds(2)) }
-        XCTAssertTrue(f.driver.sentUIDs.contains("other"))
-        restored.stop()
+        XCTAssertEqual(f.driver.sentUIDs, ["other"])
+    }
+
+    func testVideoRetryReleasesCapturedTextAndDoesNotAbsorbLaterText() async throws {
+        let f = try Fixture(pending: true); defer { f.clean() }
+        let video = holdMessage("video", .video, "[视频]")
+        let text = holdMessage("text", .text, "It connects but prints blank pages")
+        f.driver.captures["customer"] = try holdCapture(messages: [video, text], pending: true)
+        await f.capture()
+        await f.scheduler.receiveVideoTransferEvent(.init(uid: "customer", messageID: video.id, phase: .waitingForRetry))
+        await f.ticks(15)
+        let first = await f.generator.captures
+        XCTAssertEqual(first.map { $0.batch?.customerMessageIDs }, [[text.id]])
+        XCTAssertEqual(f.driver.sent, ["实际答复"])
+        XCTAssertEqual(f.scheduler.pendingVideoBatchesSnapshot.first?.capture.batch?.customerMessageIDs, [video.id])
+
+        let followup = holdMessage("text-2", .text, "Can I try another roll?")
+        f.driver.captures["customer"] = try holdCapture(messages: [video, text, followup], targetIDs: [followup.id])
+        f.driver.discoveries = [.init(uid: "customer", hasUnreadEvidence: true)]
+        f.scheduler.requestAXRefresh()
+        await f.ticks(15)
+        let captures = await f.generator.captures
+        XCTAssertEqual(captures.map { $0.batch?.customerMessageIDs }, [[text.id], [followup.id]])
+        XCTAssertEqual(f.scheduler.pendingVideoBatchesSnapshot.first?.capture.batch?.customerMessageIDs, [video.id])
     }
 
     func testTextFollowingVideoWaitsAndJoinsOneActualReply() async throws {
@@ -185,7 +220,7 @@ final class PDDVideoHoldingNoticeTests: XCTestCase {
     }
     private final class Driver: AutoReplyAutomationDriver {
         var captures: [String: AutoReplyCapture] = [:]; var discoveries: [AutoReplyDiscovery] = []
-        var sent: [String] = []; var sentUIDs: [String] = []; var result: AutoReplyDeliveryResult?
+        var sent: [String] = []; var sentUIDs: [String] = []
         func discover() async throws -> [AutoReplyDiscovery] { defer { discoveries = [] }; return discoveries }
         func capture(uid: String, after cursor: AutoReplyCursor) async throws -> AutoReplyCapture {
             guard let capture = captures.removeValue(forKey: uid) else { return .init(uid: uid, fullHistory: [], batch: nil, customerCursor: cursor, unexpectedServiceMessageIDs: []) }
@@ -193,7 +228,7 @@ final class PDDVideoHoldingNoticeTests: XCTestCase {
         }
         func preflight(uid: String, after cursor: AutoReplyCursor) async throws -> AutoReplyCapture? { nil }
         func send(uid: String, text: String, expectedCustomerCursor: AutoReplyCursor) async throws -> AutoReplyDeliveryResult {
-            sent.append(text); sentUIDs.append(uid); return result ?? .sent(serviceMessageID: "service-\(sent.count)")
+            sent.append(text); sentUIDs.append(uid); return .sent(serviceMessageID: "service-\(sent.count)")
         }
     }
     private actor Generator: AutoReplyGenerating {

@@ -282,7 +282,11 @@ struct PinduoduoV2RequestBuilder: Sendable {
         guard !configuredInstructions.isEmpty else {
             throw PinduoduoV2ClientError.invalidConfiguration("Pinduoduo V2 reply instructions are empty")
         }
-        let instructions = configuredInstructions + "\n\n" + CustomerFacingReplyPolicy.generationInstructions
+        let requestTime = now()
+        let cutoff = requestTime.addingTimeInterval(-48 * 60 * 60)
+        let contextInstructions = "Use the explicit target messages and conversation context dated at or after \(PinduoduoV2DateCodec.string(cutoff)). Ignore any older context retained by the service."
+        let instructions = [configuredInstructions, CustomerFacingReplyPolicy.generationInstructions, contextInstructions]
+            .joined(separator: "\n\n")
         guard instructions.utf8.count <= 16_384 else {
             throw PinduoduoV2ClientError.invalidConfiguration(
                 "Pinduoduo V2 reply instructions exceed 16,384 UTF-8 bytes"
@@ -290,8 +294,7 @@ struct PinduoduoV2RequestBuilder: Sendable {
         }
         let ledger = PinduoduoV2HistoryLedger(rootDirectory: rootDirectory, customerUID: capture.uid)
         let synchronized = try ledger.snapshot()
-        let cutoff = now().addingTimeInterval(-30 * 24 * 60 * 60)
-        let futureLimit = now().addingTimeInterval(5 * 60)
+        let futureLimit = requestTime.addingTimeInterval(5 * 60)
 
         var targetIDs = Array(batch.customerMessageIDs).sorted()
         if targetIDs.isEmpty, batch.incomingHandoffKey != nil,
@@ -363,8 +366,7 @@ struct PinduoduoV2RequestBuilder: Sendable {
                     let canReorderContext = message.sender == .customer && message.kind == .text
                         && !targetSet.contains(message.id) && transcriptOwners[message.id] == nil
                     guard candidate.text == message.content || (canReorderContext
-                        && candidate.text.components(separatedBy: "\n").sorted()
-                            == message.content.components(separatedBy: "\n").sorted()) else { return false }
+                        && PDDMessageBodyText.sameAXTextFragments(candidate.text, message.content)) else { return false }
                     let canonical = PDDChatMessage(id: message.id, sender: message.sender,
                         content: candidate.text, displayTime: message.displayTime, kind: message.kind,
                         capturedAt: message.capturedAt)
@@ -383,11 +385,23 @@ struct PinduoduoV2RequestBuilder: Sendable {
         guard requiredIDs.count <= 100 else {
             throw PinduoduoV2ClientError.invalidRequest("Target videos and speech exceed the 100-message request limit")
         }
+        let videosWithFrames = Set(capture.videoAttachments.filter { !$0.frames.isEmpty }.map(\.messageID))
         let eligible = transportHistory.filter { message in
             if message.sender == .service,
                synchronized.suppressedDeliveredServiceIDs.contains(message.id) { return false }
-            return requiredIDs.contains(message.id)
-                || (message.capturedAt >= cutoff && synchronized.messages[message.id] == nil)
+            if requiredIDs.contains(message.id) { return true }
+            // The first hosted copy fixes the video's frame IDs. Leave a
+            // pending video out of context until its frames can travel with it.
+            if message.sender == .customer, message.kind == .video,
+               !videosWithFrames.contains(message.id) { return false }
+            guard synchronized.messages[message.id] == nil else { return false }
+            // AX reads can capture an older visible row for the first time.
+            // Use its native timestamp for context expiry when available.
+            if let milliseconds = PDDAXSnapshotOrder.messageOrdinal(from: message.id),
+               milliseconds >= 1_000_000_000_000 {
+                return Date(timeIntervalSince1970: TimeInterval(milliseconds) / 1_000) >= cutoff
+            }
+            return message.capturedAt >= cutoff
         }
         // Reserve space for the complete target batch and its speech before
         // retaining older context; never truncate speech to fit the window.

@@ -260,12 +260,15 @@ final class PDDVideoTransferArmer: PDDVideoTransferArming {
                 try await stateStore.recordAttempt(key: key)
                 await eventHandler(.init(uid: uid, messageID: messageID, phase: .downloading))
                 try await stateStore.transition(key: key, to: .downloading)
-                do {
-                    _ = try await downloader.download(from: sourceURL, to: partialURL)
-                } catch {
-                    _ = try await alternateDownloader.download(
-                        from: sourceURL, to: partialURL
-                    )
+                _ = try await withOperationDeadline(
+                    .seconds(PDDUnlimitedVideoDownloadSessionPolicy.transferTimeoutSeconds), stage: "video-download"
+                ) {
+                    do {
+                        return try await downloader.download(from: sourceURL, to: partialURL)
+                    } catch {
+                        try Task.checkCancellation()
+                        return try await alternateDownloader.download(from: sourceURL, to: partialURL)
+                    }
                 }
                 try await stateStore.transition(key: key, to: .validating)
                 let summary = try await PDDVideoFileInspector.inspect(partialURL)
@@ -311,6 +314,7 @@ final class PDDVideoTransferArmer: PDDVideoTransferArming {
                 await foregroundCompletion.finish()
                 return
             } catch {
+                try? FileManager.default.removeItem(at: partialURL)
                 await Self.handleFailure(
                     uid: uid, messageID: messageID, key: key, error: error,
                     stateStore: stateStore, eventHandler: eventHandler
@@ -346,19 +350,12 @@ final class PDDVideoTransferArmer: PDDVideoTransferArming {
         let detail = PDDVideoTransferFailureCategory.diagnostic(error)
         let record = try? await stateStore.record(key)
         guard record?.phase != .terminalFailure else { return }
-        if let delay = PDDVideoRetryPolicy.delay(afterFailure: record?.retryIndex ?? 0) {
-            try? await stateStore.scheduleRetry(key: key, category: category,
-                nextAttemptAt: Date().addingTimeInterval(delay), failureDetail: detail)
-            await eventHandler(.init(uid: uid, messageID: messageID, phase: .waitingForRetry,
-                diagnostic: "category=\(category.rawValue) cause=\(detail); retry=\((record?.retryIndex ?? 0) + 1)/\(PDDVideoRetryPolicy.maximumRetries) retry_in=\(Int(delay))s"))
-            return
-        }
         try? await stateStore.transition(
             key: key, to: .terminalFailure, failure: category, failureDetail: detail
         )
         await eventHandler(.init(
             uid: uid, messageID: messageID, phase: .failed,
-            diagnostic: "category=\(category.rawValue) cause=\(detail); maximum 3 retries exhausted; ask product problem"
+            diagnostic: "category=\(category.rawValue) cause=\(detail); proceed without video"
         ))
         if (try? await stateStore.markFallbackEmitted(key: key)) == true {
             await eventHandler(.init(

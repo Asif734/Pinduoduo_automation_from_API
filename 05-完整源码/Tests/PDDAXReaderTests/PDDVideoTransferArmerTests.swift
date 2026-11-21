@@ -36,36 +36,30 @@ final class PDDVideoTransferArmerTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: attachment.localURL.path))
     }
 
-    func testThreeRetriesSurviveRestartThenAskProductProblemExactlyOnce() async throws {
+    func testFailedVideoAsksProductProblemImmediatelyAndOnlyOnceAcrossRestart() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let recorder = VideoOrderRecorder()
         let url = root.appendingPathComponent("transfer-state.json")
         let key = PDDVideoTransferKey(uid: "customer", messageID: "video")
         // Recreate the armer and store on each failure to exercise restart durability.
-        for failure in 0..<5 {
+        for _ in 0..<2 {
             let armer = PDDVideoTransferArmer(destinationRoot: root,
                 registry: PDDVideoTransferRegistry(),
                 analysisInbox: PDDVideoAnalysisInbox(stateURL: root.appendingPathComponent("hashes.json")),
                 stateStore: PDDDurableVideoTransferStore(url: url),
                 eventHandler: { recorder.append($0.phase.rawValue) })
-            await armer.reportFailure(uid: "customer", messageID: "video", error: PDDCustomerVideoError.clickFailed)
+            await armer.reportFailure(uid: "customer", messageID: "video", error: OperationTimeout(stage: "video-download"))
             let store = PDDDurableVideoTransferStore(url: url)
             let record = try await store.record(key)
-            if failure < 3 {
-                XCTAssertEqual(record?.phase, .waitingForRetry)
-                XCTAssertEqual(record?.retryIndex, failure + 1)
-                XCTAssertNotNil(record?.nextAttemptAt)
-                XCTAssertFalse(recorder.values.contains("fallbackRequired"))
-            } else {
-                XCTAssertEqual(record?.phase, .terminalFailure)
-                XCTAssertEqual(record?.retryIndex, 3)
-                XCTAssertNil(record?.nextAttemptAt)
-                let due = try await store.claimDueRecords()
-                XCTAssertTrue(due.isEmpty)
-            }
+            XCTAssertEqual(record?.phase, .terminalFailure)
+            XCTAssertEqual(record?.failure, .responseTimeout)
+            XCTAssertEqual(record?.retryIndex, 0)
+            XCTAssertNil(record?.nextAttemptAt)
+            let due = try await store.claimDueRecords()
+            XCTAssertTrue(due.isEmpty)
         }
-        XCTAssertEqual(recorder.values, ["waitingForRetry", "waitingForRetry", "waitingForRetry", "failed", "fallbackRequired"])
+        XCTAssertEqual(recorder.values, ["failed", "fallbackRequired"])
     }
 
     func testCancellationDoesNotCreateVideoFailureOrContinueToAnotherVideo() async throws {

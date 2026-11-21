@@ -1,6 +1,10 @@
 import Foundation
 
 enum PDDMessageBodyText {
+    static func sameAXTextFragments(_ left: String, _ right: String) -> Bool {
+        left.components(separatedBy: "\n").sorted() == right.components(separatedBy: "\n").sorted()
+    }
+
     /// Read receipts are UI metadata. Never apply this to customer-authored text.
     static func serviceBodyWithoutReadStatus(_ text: String) -> String {
         text.components(separatedBy: .newlines)

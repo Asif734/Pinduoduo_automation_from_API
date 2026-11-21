@@ -40,6 +40,7 @@ struct PDDPendingVideoBatch: Codable, Equatable, Sendable, Identifiable {
     var completedAttachmentsByMessageID: [String: AutoReplyVideoAttachment]
     var failedMessageIDs: Set<String>
     var duplicateMessageIDs: Set<String>
+    var allowsIndependentText: Bool
     let createdAt: Date
 
     init(
@@ -50,6 +51,7 @@ struct PDDPendingVideoBatch: Codable, Equatable, Sendable, Identifiable {
         completedAttachmentsByMessageID: [String: AutoReplyVideoAttachment] = [:],
         failedMessageIDs: Set<String> = [],
         duplicateMessageIDs: Set<String> = [],
+        allowsIndependentText: Bool = false,
         createdAt: Date = Date()
     ) {
         self.id = id
@@ -59,12 +61,13 @@ struct PDDPendingVideoBatch: Codable, Equatable, Sendable, Identifiable {
         self.completedAttachmentsByMessageID = completedAttachmentsByMessageID
         self.failedMessageIDs = failedMessageIDs
         self.duplicateMessageIDs = duplicateMessageIDs
+        self.allowsIndependentText = allowsIndependentText
         self.createdAt = createdAt
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, uid, capture, expectedMessageIDs, completedAttachmentsByMessageID
-        case failedMessageIDs, duplicateMessageIDs, createdAt
+        case failedMessageIDs, duplicateMessageIDs, allowsIndependentText, createdAt
     }
 
     init(from decoder: Decoder) throws {
@@ -83,6 +86,7 @@ struct PDDPendingVideoBatch: Codable, Equatable, Sendable, Identifiable {
         duplicateMessageIDs = try container.decodeIfPresent(
             Set<String>.self, forKey: .duplicateMessageIDs
         ) ?? []
+        allowsIndependentText = try container.decodeIfPresent(Bool.self, forKey: .allowsIndependentText) ?? false
         createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
     }
 }

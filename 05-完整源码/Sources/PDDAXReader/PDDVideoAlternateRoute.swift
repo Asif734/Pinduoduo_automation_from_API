@@ -25,15 +25,14 @@ struct PDDAlternateVideoDownloadClient: Sendable {
             while let result = try await group.next() {
                 if let result { winner = result; group.cancelAll(); break }
             }
-            guard let winner else {
+            defer {
                 temporaryURLs.forEach { try? FileManager.default.removeItem(at: $0) }
-                throw PDDCustomerVideoError.downloadFailed
             }
+            try await group.waitForAll()
+            try Task.checkCancellation()
+            guard let winner else { throw PDDCustomerVideoError.downloadFailed }
             try? FileManager.default.removeItem(at: destinationURL)
             try FileManager.default.moveItem(at: winner, to: destinationURL)
-            for temporary in temporaryURLs where temporary != winner {
-                try? FileManager.default.removeItem(at: temporary)
-            }
             return destinationURL
         }
     }
@@ -73,29 +72,21 @@ struct PDDAlternateVideoDownloadClient: Sendable {
     private func curl(
         _ sourceURL: URL, host: String, address: String, destination: URL
     ) async -> Bool {
-        await Task.detached(priority: .utility) {
-            try? FileManager.default.createDirectory(
-                at: destination.deletingLastPathComponent(), withIntermediateDirectories: true
-            )
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-            process.arguments = [
+        guard !Task.isCancelled else { return false }
+        try? FileManager.default.createDirectory(
+            at: destination.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let timeout = PDDUnlimitedVideoDownloadSessionPolicy.transferTimeoutSeconds
+        let result = await BoundedProcess.run(.init(
+            executable: URL(fileURLWithPath: "/usr/bin/curl"),
+            arguments: [
                 "--config", "-", "--fail", "--silent", "--show-error",
-                "--connect-timeout", "5", "--max-time", "15",
+                "--connect-timeout", "5", "--max-time", String(timeout),
                 "--output", destination.path, "--resolve", "\(host):443:\(address)"
-            ]
-            let input = Pipe()
-            process.standardInput = input
-            process.standardOutput = FileHandle.nullDevice
-            process.standardError = FileHandle.nullDevice
-            do {
-                try process.run()
-                input.fileHandleForWriting.write(Data("url = \"\(sourceURL.absoluteString)\"\n".utf8))
-                try? input.fileHandleForWriting.close()
-                process.waitUntilExit()
-                return process.terminationStatus == 0
-            } catch { return false }
-        }.value
+            ],
+            standardInput: Data("url = \"\(sourceURL.absoluteString)\"\n".utf8)
+        ), softDeadline: .seconds(timeout), hardDeadline: .seconds(timeout))
+        return !Task.isCancelled && result.termination == .exited(0)
     }
 
     private static func isPublicIPv4(_ value: String) -> Bool {

@@ -4,12 +4,20 @@ import XCTest
 @MainActor
 final class AutoReplySchedulerTests: XCTestCase {
     func testHostedGenerationFailureHandsOffWithoutFakingAnAnswer() async throws {
+        try await assertHostedFailureHandsOff(code: "CODEX_FAILED")
+    }
+
+    func testUnrepairableHostedConflictHandsOffWithoutFakingAnAnswer() async throws {
+        try await assertHostedFailureHandsOff(code: "MESSAGE_ID_CONFLICT")
+    }
+
+    private func assertHostedFailureHandsOff(code: String) async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let uid = "GZC-000123"
         let driver = ControlledAutoReplyDriver(capturesByUID: [uid: [["question"]]])
         driver.discoveries = [.init(uid: uid, hasUnreadEvidence: true)]
-        let generator = AlwaysFailingCodexGenerator(error: PinduoduoV2ClientError.jobFailed(code: "CODEX_FAILED", message: "worker failed"))
+        let generator = AlwaysFailingCodexGenerator(error: PinduoduoV2ClientError.jobFailed(code: code, message: "worker failed"))
         let store = AutoReplyStore(rootDirectory: root)
         let scheduler = try AutoReplyScheduler(driver: driver, generator: generator, store: store,
             configuredMaximumConcurrentGenerations: 1, availableMemoryBytes: { 64 << 30 })

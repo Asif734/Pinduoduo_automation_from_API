@@ -16,7 +16,7 @@ final class CustomerFacingReplyPolicyTests: XCTestCase {
         for text in ["I can’t view the video here.", "Your video is still loading.", "我这边无法查看视频。", "您的视频还在加载。"] {
             XCTAssertEqual(CustomerFacingReplyPolicy.violation(in: text), "video processing status")
         }
-        for text in PDDVideoHoldingNotice.messages + ["The guides are obscured by your hands.", "视频中看不清导纸器，请拍一下该部位。"] {
+        for text in [PDDVideoHoldingNotice.message, "The guides are obscured by your hands.", "视频中看不清导纸器，请拍一下该部位。"] {
             XCTAssertNil(CustomerFacingReplyPolicy.violation(in: text))
         }
     }
