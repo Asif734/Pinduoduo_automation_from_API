@@ -363,7 +363,7 @@ struct PinduoduoV2RequestBuilder: Sendable {
                     }
                     // AX can enumerate the same text fragments in a different order.
                     // Retain the archived server copy only for previously accepted context.
-                    let canReorderContext = message.sender == .customer && message.kind == .text
+                    let canReorderContext = message.sender == .customer && message.kind.supportsAXTextFragmentReordering
                         && !targetSet.contains(message.id) && transcriptOwners[message.id] == nil
                     guard candidate.text == message.content || (canReorderContext
                         && PDDMessageBodyText.sameAXTextFragments(candidate.text, message.content)) else { return false }

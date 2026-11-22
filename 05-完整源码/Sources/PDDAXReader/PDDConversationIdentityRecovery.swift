@@ -88,7 +88,8 @@ enum PDDConversationIdentityRecovery {
             guard message.id == previous.id, message.kind == previous.kind,
                   message.displayTime == previous.displayTime else { return nil }
             if message.content == previous.content { continue }
-            guard message.kind == .text, PDDMessageBodyText.sameAXTextFragments(message.content, previous.content) else { return nil }
+            guard message.kind.supportsAXTextFragmentReordering,
+                  PDDMessageBodyText.sameAXTextFragments(message.content, previous.content) else { return nil }
             repaired[index] = .init(id: message.id, sender: .customer, content: previous.content,
                 displayTime: message.displayTime, kind: message.kind, capturedAt: message.capturedAt)
         }

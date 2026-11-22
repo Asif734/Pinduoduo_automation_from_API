@@ -223,7 +223,8 @@ struct PerUserChatStore {
             if let index = indexes[message.id] {
                 let previous = merged[index]
                 if fileName == "history-ax-first.jsonl", previous.sender == .customer, message.sender == .customer,
-                   previous.kind == .text, message.kind == .text, previous.content != message.content,
+                   previous.kind == message.kind, message.kind.supportsAXTextFragmentReordering,
+                   previous.content != message.content,
                    PDDMessageBodyText.sameAXTextFragments(previous.content, message.content) {
                     continue // AX can change fragment order on each read.
                 }

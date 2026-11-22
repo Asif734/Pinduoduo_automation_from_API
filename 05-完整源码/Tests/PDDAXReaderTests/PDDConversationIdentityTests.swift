@@ -346,11 +346,21 @@ final class PDDConversationIdentityTests: XCTestCase {
     }
 
     func testAliasRecoveryRestoresVerifiedAnsweredTextOrderAndQueuesOneReply() throws {
+        try assertAliasRecoveryRestoresVerifiedAnsweredOrder(kind: .text, firstFragment: "Line A")
+    }
+
+    func testAliasRecoveryRestoresVerifiedAnsweredLinkOrderAndQueuesOneReply() throws {
+        try assertAliasRecoveryRestoresVerifiedAnsweredOrder(kind: .link, firstFragment: "https://example.com/photo.jpg")
+    }
+
+    private func assertAliasRecoveryRestoresVerifiedAnsweredOrder(kind: ChatContentKind, firstFragment: String) throws {
         let root = temporary(); defer { try? FileManager.default.removeItem(at: root) }
         let canonical = PDDConversationKey.make(locator: .init(nickname: "A***"))
         let alias = PDDConversationKey.make(locator: .init(nickname: "A**"))
-        let answered = message("old", "Line A\nLine B\nLine C")
-        let reordered = message(answered.id, "Line B\nLine C\nLine A")
+        let answered = PDDChatMessage(id: "old", sender: .customer, content: "\(firstFragment)\nLine B\nLine C",
+            displayTime: nil, kind: kind, capturedAt: Date())
+        let reordered = PDDChatMessage(id: answered.id, sender: .customer, content: "Line B\nLine C\n\(firstFragment)",
+            displayTime: nil, kind: kind, capturedAt: answered.capturedAt)
         let first = message("first", "unanswered question")
         let followup = message("next", "follow-up question")
         let answeredTimeline = try AutoReplyTimeline.make(messages: [answered])

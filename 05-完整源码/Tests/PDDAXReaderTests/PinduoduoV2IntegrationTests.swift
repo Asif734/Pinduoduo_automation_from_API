@@ -604,6 +604,38 @@ final class PinduoduoV2IntegrationTests: XCTestCase {
         XCTAssertNil(frozen.messageFingerprints[old.id])
     }
 
+    func testReorderedAcceptedLinkContextDoesNotParkNewTextButChangedURLDoes() throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let uid = "GZC-LINK"
+        let imageURL = "https://chat-img.pddugc.com/chat-pic-mall-user-v1/unit-test.jpeg"
+        let original = PDDChatMessage(id: "middlePanel_list_old", sender: .customer,
+            content: "Customer:\n/unit-test.jpeg\n\(imageURL)\n这是刚买的", displayTime: nil,
+            kind: .link, capturedAt: Date().addingTimeInterval(-20))
+        let builder = PinduoduoV2RequestBuilder(rootDirectory: root)
+        let first = try builder.freeze(localJobID: UUID(),
+            capture: makeCapture(uid: uid, messages: [original], targets: [original.id]))
+        try PinduoduoV2HistoryLedger(rootDirectory: root, customerUID: uid)
+            .markAccepted(messages: first.messageFingerprints, media: first.mediaFingerprints)
+        let next = message("middlePanel_list_new", .customer, "用数据线连接的", seconds: 0)
+        func recapture(link: String, targets: [String]) throws -> AutoReplyCapture {
+            let earlier = PDDChatMessage(id: original.id, sender: .customer,
+                content: "这是刚买的\nCustomer:\n/unit-test.jpeg\n\(link)", displayTime: nil,
+                kind: .link, capturedAt: original.capturedAt)
+            return try makeCapture(uid: uid, messages: [earlier, next], targets: targets)
+        }
+        let reordered = try recapture(link: imageURL, targets: [next.id])
+        let changed = try recapture(link: imageURL + "?different=1", targets: [next.id])
+        let retargeted = try recapture(link: imageURL, targets: [original.id, next.id])
+        XCTAssertThrowsError(try builder.freeze(localJobID: UUID(), capture: changed))
+        XCTAssertThrowsError(try builder.freeze(localJobID: UUID(), capture: retargeted))
+
+        let frozen = try builder.freeze(localJobID: UUID(), capture: reordered)
+        let request = try JSONDecoder().decode(PinduoduoV2ReplyRequest.self, from: frozen.requestJSON)
+        XCTAssertEqual(request.messages.map(\.id), [next.id])
+        XCTAssertEqual(request.targetMessageIds, [next.id])
+    }
+
     func testLegacyWholeSecondTimestampRecoversOnlyFromMatchingFrozenFingerprint() throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

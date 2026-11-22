@@ -69,6 +69,22 @@ final class PerUserChatStoreTests: XCTestCase {
         XCTAssertEqual(result.history[0].capturedAt, first.capturedAt)
     }
 
+    func testAXFirstMergeKeepsOriginalFragmentOrderForSameCustomerLink() throws {
+        let root = temporaryRoot("ax-link-order")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = PerUserChatStore(rootDirectory: root)
+        let uid = "PDD-NAME-222222222222222222222222"
+        let first = PDDChatMessage(id: "middlePanel_list_link", sender: .customer,
+            content: "https://example.com/photo.jpg\n这是刚买的", displayTime: nil, kind: .link,
+            capturedAt: Date(timeIntervalSince1970: 100))
+        let reordered = PDDChatMessage(id: first.id, sender: .customer,
+            content: "这是刚买的\nhttps://example.com/photo.jpg", displayTime: nil, kind: .link,
+            capturedAt: Date(timeIntervalSince1970: 200))
+        _ = try store.mergeAXFirst(uid: uid, messages: [first])
+        _ = try store.mergeAXFirst(uid: uid, messages: [reordered])
+        XCTAssertEqual(try store.loadAXFirst(uid: uid), [first])
+    }
+
     func testOCRAuthoritativeMergeRetainsAXImageEvidenceButDropsAXText() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("pdd-chat-store-hybrid-\(UUID().uuidString)")

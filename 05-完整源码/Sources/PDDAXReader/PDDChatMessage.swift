@@ -10,6 +10,8 @@ enum ChatContentKind: String, Codable, Equatable, Sendable {
     case image
     case video
     case link
+
+    var supportsAXTextFragmentReordering: Bool { self == .text || self == .link }
 }
 
 struct PDDChatMessage: Codable, Equatable, Sendable {
