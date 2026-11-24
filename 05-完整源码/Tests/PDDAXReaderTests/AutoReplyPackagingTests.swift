@@ -28,7 +28,7 @@ final class AutoReplyPackagingTests: XCTestCase {
         XCTAssertNotEqual(candidate["CFBundleExecutable"] as? String, current["CFBundleExecutable"] as? String)
     }
 
-    func testBuildScriptSupportsCandidateOnlyBuildWithBackup() throws {
+    func testBuildScriptSupportsCandidateAndProductionReplacement() throws {
         let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         let script = try String(
             contentsOf: root.appendingPathComponent("scripts/build_app.sh"),
@@ -37,7 +37,9 @@ final class AutoReplyPackagingTests: XCTestCase {
 
         XCTAssertTrue(script.contains("--task-isolation-candidate"))
         XCTAssertTrue(script.contains("pinduodou_automation.app"))
-        XCTAssertTrue(script.contains("outputs/backups"))
+        XCTAssertTrue(script.contains("--install"))
+        XCTAssertTrue(script.contains("replace_app_bundle.sh"))
+        XCTAssertFalse(script.contains("outputs/backups"))
         XCTAssertTrue(script.contains("TaskIsolationCandidateInfo.plist"))
         XCTAssertTrue(script.contains("PDDLatest.icns"))
     }

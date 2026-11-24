@@ -7,6 +7,7 @@ APP_PATH="$PROJECT_ROOT/outputs/拼多多AX读取器.app"
 PROBE_APP_PATH="$PROJECT_ROOT/outputs/拼多多AX单次解析测试器.app"
 AUTO_REPLY_APP_PATH="$PROJECT_ROOT/outputs/拼多多全自动客服.app"
 CANDIDATE_APP_PATH="$PROJECT_ROOT/outputs/pinduodou_automation.app"
+INSTALLED_APP_PATH="/Applications/${AUTO_REPLY_APP_PATH:t}"
 SIGNING_IDENTITY="$($PROJECT_ROOT/scripts/select_codesign_identity.sh)"
 PYTHON_RUNTIME_NAME="cpython-3.12.14+20260825-aarch64-apple-darwin-install_only_stripped.tar.gz"
 PYTHON_RUNTIME_SHA256="8b0f1fa71eab7ca644e482c631807a1116fa848491051cd1c8d9429491de63a6"
@@ -67,6 +68,15 @@ copy_auto_reply_resources() {
     fi
 }
 
+case "$#:${1:-}" in
+    0:|1:--install|1:--task-isolation-candidate) ;;
+    *) print -u2 "用法：$0 [--install|--task-isolation-candidate]"; exit 64 ;;
+esac
+
+mkdir -p "$PROJECT_ROOT/outputs"
+APP_STAGING_ROOT="$(/usr/bin/mktemp -d "$PROJECT_ROOT/outputs/.pdd-app-build.XXXXXX")"
+trap '/bin/rm -rf -- "$APP_STAGING_ROOT"' EXIT
+
 if [[ "${1:-}" == "--task-isolation-candidate" ]]; then
     case "$CANDIDATE_APP_PATH" in
         "$PROJECT_ROOT"/outputs/*.app) ;;
@@ -75,28 +85,20 @@ if [[ "${1:-}" == "--task-isolation-candidate" ]]; then
     cd "$PROJECT_ROOT"
     swift build "${SWIFT_BUILD_ARGS[@]}" -c release --product PDDAXReader
     BIN_DIR="$(swift build "${SWIFT_BUILD_ARGS[@]}" -c release --show-bin-path)"
-    if [[ -e "$CANDIDATE_APP_PATH" ]]; then
-        BACKUP_ROOT="$PROJECT_ROOT/outputs/backups/$(date +%Y%m%d-%H%M%S)"
-        mkdir -p "$BACKUP_ROOT"
-        mv -- "$CANDIDATE_APP_PATH" "$BACKUP_ROOT/"
-    fi
-    mkdir -p "$CANDIDATE_APP_PATH/Contents/MacOS" "$CANDIDATE_APP_PATH/Contents/Resources"
-    cp "$BIN_DIR/PDDAXReader" "$CANDIDATE_APP_PATH/Contents/MacOS/PDDTaskIsolationCandidate"
-    cp "$PROJECT_ROOT/Resources/TaskIsolationCandidateInfo.plist" "$CANDIDATE_APP_PATH/Contents/Info.plist"
+    staged_candidate="$APP_STAGING_ROOT/${CANDIDATE_APP_PATH:t}"
+    mkdir -p "$staged_candidate/Contents/MacOS" "$staged_candidate/Contents/Resources"
+    cp "$BIN_DIR/PDDAXReader" "$staged_candidate/Contents/MacOS/PDDTaskIsolationCandidate"
+    cp "$PROJECT_ROOT/Resources/TaskIsolationCandidateInfo.plist" "$staged_candidate/Contents/Info.plist"
     cp "$PROJECT_ROOT/Resources/AppIcon/PDDLatest.icns" \
-        "$CANDIDATE_APP_PATH/Contents/Resources/PDDLatest.icns"
-    copy_auto_reply_resources "$CANDIDATE_APP_PATH"
+        "$staged_candidate/Contents/Resources/PDDLatest.icns"
+    copy_auto_reply_resources "$staged_candidate"
     cmp "$PROJECT_ROOT/Resources/FolderKnowledge/serve_folder.py" \
-        "$CANDIDATE_APP_PATH/Contents/Resources/FolderKnowledge/serve_folder.py"
-    chmod 755 "$CANDIDATE_APP_PATH/Contents/MacOS/PDDTaskIsolationCandidate"
-    sign_and_verify "$CANDIDATE_APP_PATH"
+        "$staged_candidate/Contents/Resources/FolderKnowledge/serve_folder.py"
+    chmod 755 "$staged_candidate/Contents/MacOS/PDDTaskIsolationCandidate"
+    sign_and_verify "$staged_candidate"
+    /bin/zsh "$SCRIPT_DIR/replace_app_bundle.sh" "$staged_candidate" "$CANDIDATE_APP_PATH"
     print "$CANDIDATE_APP_PATH"
     exit 0
-fi
-
-if [[ $# -ne 0 ]]; then
-    print -u2 "用法：$0 [--task-isolation-candidate]"
-    exit 64
 fi
 
 case "$APP_PATH" in
@@ -139,26 +141,32 @@ fi
 chmod 755 "$PROBE_APP_PATH/Contents/MacOS/PDDAXSingleParseProbe"
 sign_and_verify "$PROBE_APP_PATH"
 
-rm -rf -- "$AUTO_REPLY_APP_PATH"
-mkdir -p "$AUTO_REPLY_APP_PATH/Contents/MacOS" "$AUTO_REPLY_APP_PATH/Contents/Resources"
-cp "$BIN_DIR/PDDAXReader" "$AUTO_REPLY_APP_PATH/Contents/MacOS/PDDAutoReply"
-cp "$PROJECT_ROOT/Resources/AutoReplyInfo.plist" "$AUTO_REPLY_APP_PATH/Contents/Info.plist"
-copy_auto_reply_resources "$AUTO_REPLY_APP_PATH"
+staged_app="$APP_STAGING_ROOT/${AUTO_REPLY_APP_PATH:t}"
+mkdir -p "$staged_app/Contents/MacOS" "$staged_app/Contents/Resources"
+cp "$BIN_DIR/PDDAXReader" "$staged_app/Contents/MacOS/PDDAutoReply"
+cp "$PROJECT_ROOT/Resources/AutoReplyInfo.plist" "$staged_app/Contents/Info.plist"
+copy_auto_reply_resources "$staged_app"
 cmp "$PROJECT_ROOT/Resources/CustomerService/customer-reply-prompt.md" \
-    "$AUTO_REPLY_APP_PATH/Contents/Resources/CustomerService/customer-reply-prompt.md"
+    "$staged_app/Contents/Resources/CustomerService/customer-reply-prompt.md"
 if [[ -f "$PROJECT_ROOT/Resources/FolderKnowledge/config.json" ]]; then
     cmp "$PROJECT_ROOT/Resources/FolderKnowledge/serve_folder.py" \
-        "$AUTO_REPLY_APP_PATH/Contents/Resources/FolderKnowledge/serve_folder.py"
+        "$staged_app/Contents/Resources/FolderKnowledge/serve_folder.py"
 else
-cmp "$PROJECT_ROOT/Resources/V2Knowledge/retrieve_top12.py" \
-    "$AUTO_REPLY_APP_PATH/Contents/Resources/V2Knowledge/retrieve_top12.py"
-cmp "$PROJECT_ROOT/Resources/V2Knowledge/serve_top12.py" \
-    "$AUTO_REPLY_APP_PATH/Contents/Resources/V2Knowledge/serve_top12.py"
-cmp "$PROJECT_ROOT/Resources/KnowledgeBase/Grozziie-China-KB-2026-08-24.zip" \
-    "$AUTO_REPLY_APP_PATH/Contents/Resources/KnowledgeBase/Grozziie-China-KB-2026-08-24.zip"
+    cmp "$PROJECT_ROOT/Resources/V2Knowledge/retrieve_top12.py" \
+        "$staged_app/Contents/Resources/V2Knowledge/retrieve_top12.py"
+    cmp "$PROJECT_ROOT/Resources/V2Knowledge/serve_top12.py" \
+        "$staged_app/Contents/Resources/V2Knowledge/serve_top12.py"
+    cmp "$PROJECT_ROOT/Resources/KnowledgeBase/Grozziie-China-KB-2026-08-24.zip" \
+        "$staged_app/Contents/Resources/KnowledgeBase/Grozziie-China-KB-2026-08-24.zip"
 fi
-chmod 755 "$AUTO_REPLY_APP_PATH/Contents/MacOS/PDDAutoReply"
-sign_and_verify "$AUTO_REPLY_APP_PATH"
+chmod 755 "$staged_app/Contents/MacOS/PDDAutoReply"
+sign_and_verify "$staged_app"
+/bin/zsh "$SCRIPT_DIR/replace_app_bundle.sh" "$staged_app" "$AUTO_REPLY_APP_PATH"
+
+if [[ "${1:-}" == "--install" ]]; then
+    /bin/zsh "$SCRIPT_DIR/replace_app_bundle.sh" "$staged_app" "$INSTALLED_APP_PATH"
+    print "$INSTALLED_APP_PATH"
+fi
 
 print "$APP_PATH"
 print "$PROBE_APP_PATH"

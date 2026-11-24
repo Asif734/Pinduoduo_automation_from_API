@@ -90,9 +90,20 @@ final class AutoReplyViewModel: ObservableObject {
     @Published private(set) var lastRuntimeIssue: String?
     @Published private(set) var latestVideoStatus: PDDVideoProgressStatus?
     @Published private(set) var compatibilityReport: PDDCompatibilityReport?
+    @Published private(set) var logActionMessage: String?
+    @Published private(set) var isManagingLogs = false
 
     var canStart: Bool { compatibilityReport?.overallStatus != .fail }
     var canStop: Bool { desiredRunning || isRunning }
+    var needsHostedAPIKey: Bool { (try? PinduoduoV2EnvironmentCredentialProvider().apiKey()) == nil }
+
+    func saveHostedAPIKey(_ key: String) throws {
+        try PinduoduoV2EnvironmentCredentialProvider.saveAPIKey(key)
+        compatibilityReport = nil
+        startupPrepared = false
+        status = BilingualText.lines("托管 API 密钥已保存。准备好后请点击开始。",
+                                     "Hosted API key saved. Press Start when ready.")
+    }
 
     func canDeleteJob(_ id: UUID) -> Bool { runtime.canDeleteJob(id) }
 
@@ -411,6 +422,55 @@ final class AutoReplyViewModel: ObservableObject {
             status = BilingualText.lines("兼容性报告已导出", "Compatibility report exported")
         } catch {
             status = BilingualText.lines("兼容性报告导出失败：\(error.localizedDescription)", "Compatibility report export failed: \(error.localizedDescription)")
+        }
+    }
+
+    func downloadLogs() async {
+        guard !isManagingLogs else { return }
+        isManagingLogs = true
+        defer { isManagingLogs = false }
+
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd-HHmmss"
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "Pinduoduo-Logs-\(formatter.string(from: Date())).zip"
+        panel.allowedContentTypes = [.zip]
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+
+        logActionMessage = BilingualText.lines("正在打包日志…", "Compressing logs…")
+        let root = identity.dataRoot
+        do {
+            try await Task.detached(priority: .utility) {
+                try AutomationStepLog.exportArchive(root: root, to: destination)
+            }.value
+            logActionMessage = BilingualText.lines("日志已保存：\(destination.lastPathComponent)",
+                                                   "Logs saved as \(destination.lastPathComponent)")
+        } catch AutomationStepLog.ArchiveError.noLogs {
+            logActionMessage = BilingualText.lines("没有可下载的日志", "No logs to download")
+        } catch {
+            logActionMessage = BilingualText.lines("下载日志失败：\(error.localizedDescription)",
+                                                   "Could not download logs. \(error.localizedDescription)")
+        }
+    }
+
+    func deleteLogs() async {
+        guard !isManagingLogs else { return }
+        isManagingLogs = true
+        defer { isManagingLogs = false }
+
+        let root = identity.dataRoot
+        do {
+            let deleted = try await Task.detached(priority: .utility) {
+                try AutomationStepLog.deleteLogs(root: root)
+            }.value
+            logActionMessage = deleted
+                ? BilingualText.lines("日志已删除", "Logs deleted")
+                : BilingualText.lines("没有可删除的日志", "No logs to delete")
+        } catch {
+            logActionMessage = BilingualText.lines("删除日志失败：\(error.localizedDescription)",
+                                                   "Could not delete logs. \(error.localizedDescription)")
         }
     }
 

@@ -4,6 +4,9 @@ struct AutoReplyView: View {
     @StateObject private var model: AutoReplyViewModel
     @StateObject private var progressPanel: AutoReplyProgressPanelController
     @StateObject private var mediaPermissions: PDDMediaPermissionController
+    @State private var confirmingLogDeletion = false
+    @State private var showingHostedKeySetup = false
+    @State private var checkedHostedKeyOnLaunch = false
 
     @MainActor
     init() {
@@ -126,6 +129,24 @@ struct AutoReplyView: View {
                             toolbarLabel("只检查未读", "Check unread only")
                         }
                         .disabled(model.isRunning)
+                        Button { showingHostedKeySetup = true } label: {
+                            toolbarLabel("托管 API 密钥", "Hosted API Key")
+                        }
+                        .disabled(model.canStop)
+                        .accessibilityIdentifier("hosted-api-key")
+                        Button { Task { await model.downloadLogs() } } label: {
+                            toolbarLabel("下载日志", "Download Logs")
+                        }
+                        .disabled(model.isManagingLogs)
+                        .accessibilityIdentifier("download-logs")
+                        Button(role: .destructive) { confirmingLogDeletion = true } label: {
+                            toolbarLabel("删除日志", "Delete Logs")
+                        }
+                        .disabled(model.isManagingLogs)
+                        .accessibilityIdentifier("delete-logs")
+                    }
+                    if let message = model.logActionMessage {
+                        Text(message)
                     }
                     if let report = model.compatibilityReport {
                         Text(report.summary)
@@ -225,8 +246,26 @@ struct AutoReplyView: View {
         }
         .padding(16)
         .frame(minWidth: 1_100, minHeight: 720)
+        .sheet(isPresented: $showingHostedKeySetup) {
+            HostedAPIKeySetupView(save: model.saveHostedAPIKey)
+        }
+        .alert(BilingualText.lines("删除日志？", "Delete logs?"), isPresented: $confirmingLogDeletion) {
+            Button(BilingualText.lines("删除日志", "Delete Logs"), role: .destructive) {
+                Task { await model.deleteLogs() }
+            }
+            Button(BilingualText.lines("取消", "Cancel"), role: .cancel) {}
+        } message: {
+            Text(BilingualText.lines(
+                "这将永久删除本机已保存的诊断日志。后续操作会生成新日志。",
+                "This permanently deletes saved diagnostic logs from this Mac. New activity will create new logs."
+            ))
+        }
         .onAppear {
             model.viewAppeared()
+            if !checkedHostedKeyOnLaunch {
+                checkedHostedKeyOnLaunch = true
+                showingHostedKeySetup = model.needsHostedAPIKey
+            }
             progressPanel.show()
             progressPanel.updateInteraction()
         }

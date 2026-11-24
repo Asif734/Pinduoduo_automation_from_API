@@ -467,6 +467,36 @@ final class PinduoduoV2IntegrationTests: XCTestCase {
         XCTAssertEqual(try provider.apiKey(), "private-pdd-key")
     }
 
+    func testInAppCredentialSetupWorksWithoutProjectFiles() throws {
+        let home = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let provider = PinduoduoV2EnvironmentCredentialProvider(
+            environment: [:], currentDirectory: home.appendingPathComponent("Finder"),
+            bundleURL: home.appendingPathComponent("Applications/Pinduoduo.app"), homeDirectory: home
+        )
+        XCTAssertThrowsError(try provider.apiKey())
+        try PinduoduoV2EnvironmentCredentialProvider.saveAPIKey(" sample-key\n", homeDirectory: home)
+        XCTAssertEqual(try provider.apiKey(), "sample-key")
+        let path = home.appendingPathComponent("Library/Application Support/PDDAutoReplyShared/.env").path
+        let permissions = try FileManager.default.attributesOfItem(atPath: path)[.posixPermissions] as? NSNumber
+        XCTAssertEqual(permissions?.intValue, 0o600)
+    }
+
+    func testInAppCredentialUpdateKeepsOtherSettingsAndRejectsMultilineInput() throws {
+        let home = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let config = home.appendingPathComponent("Library/Application Support/PDDAutoReplyShared")
+        try FileManager.default.createDirectory(at: config, withIntermediateDirectories: true)
+        let env = config.appendingPathComponent(".env")
+        try Data("OTHER=preserved\nexport PINDUODUO_V2_API_KEY=previous\n".utf8).write(to: env)
+        let provider = PinduoduoV2EnvironmentCredentialProvider(candidateURLs: [env])
+        XCTAssertThrowsError(try PinduoduoV2EnvironmentCredentialProvider.saveAPIKey("bad\nkey", homeDirectory: home))
+        XCTAssertEqual(try provider.apiKey(), "previous")
+        try PinduoduoV2EnvironmentCredentialProvider.saveAPIKey("replacement", homeDirectory: home)
+        XCTAssertEqual(try provider.apiKey(), "replacement")
+        XCTAssertTrue(try String(contentsOf: env, encoding: .utf8).contains("OTHER=preserved"))
+    }
+
     func testTextRequestUsesExactPDDContractAndStableFrozenIdentity() throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

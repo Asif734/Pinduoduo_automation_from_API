@@ -259,9 +259,6 @@ final class PDDAXConversationTransferer: PDDLiveConversationTransferring {
     private func saveOpenFailure(uid: String, tree: PDDAXSemanticTree) {
         guard let logRoot else { return }
         do {
-            let directory = logRoot.appendingPathComponent("logs/transfer-diagnostics", isDirectory: true)
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            let url = directory.appendingPathComponent("open-failed-\(UUID().uuidString).json")
             let nodes: [[String: Any]] = tree.nodes.filter { node in
                 ["AXWindow", "AXWebArea"].contains(node.role)
                     || [node.value, node.title].compactMap { $0 }.contains { $0.contains("转移") || $0 == "请输入内容" }
@@ -271,8 +268,12 @@ final class PDDAXConversationTransferer: PDDLiveConversationTransferring {
                  "actions": Array(node.actionNames), "classes": Array(node.domClasses),
                  "frame": ["x": node.frame.minX, "y": node.frame.minY, "width": node.frame.width, "height": node.frame.height]]
             }
-            try JSONSerialization.data(withJSONObject: ["uid": uid, "nodes": nodes], options: [.prettyPrinted, .sortedKeys])
-                .write(to: url, options: .atomic)
+            let data = try JSONSerialization.data(
+                withJSONObject: ["uid": uid, "nodes": nodes], options: [.prettyPrinted, .sortedKeys]
+            )
+            let url = try AutomationStepLog.writeDiagnostic(
+                root: logRoot, folder: .transfer, name: "open-failed-\(UUID().uuidString).json", data: data
+            )
             AutomationStepLog.record(root: logRoot, uid: uid, step: "transfer-open-diagnostic-saved", detail: url.path)
         } catch {
             AutomationStepLog.record(root: logRoot, uid: uid, step: "transfer-open-diagnostic-failed", detail: error.localizedDescription)

@@ -91,12 +91,10 @@ struct PDDAXCaptureDiagnostic: Codable {
     var replay: PDDAXSemanticTree { .init(rootSnapshot: rootSnapshot.replay, nodes: nodes.map(\.replay)) }
 
     func save(root: URL) throws -> URL {
-        let directory = root.appendingPathComponent("logs/capture-diagnostics", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let name = "\(taskID?.uuidString ?? "visible")-\(reason).json"
-        let path = directory.appendingPathComponent(name)
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
-        try encoder.encode(self).write(to: path, options: .atomic)
-        return path
+        return try AutomationStepLog.writeDiagnostic(
+            root: root, folder: .capture, name: name, data: encoder.encode(self)
+        )
     }
 }

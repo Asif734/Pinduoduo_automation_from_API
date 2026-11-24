@@ -354,12 +354,12 @@ final class PDDTransferMenuSubmitter: PDDTransferMenuSubmitting {
             let recognized: [[String: Any]] = lines.map {
                 ["text": $0.text, "confidence": $0.confidence ?? 0, "frame": box($0.box)]
             }
-            let directory = logRoot.appendingPathComponent("logs/transfer-diagnostics", isDirectory: true)
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            let file = directory.appendingPathComponent("menu-lookup-\(UUID().uuidString).json")
-            try JSONSerialization.data(withJSONObject: ["uid": uid, "phase": phase,
+            let data = try JSONSerialization.data(withJSONObject: ["uid": uid, "phase": phase,
                 "attempt": attempt, "anchor": box(anchor), "axCandidates": candidates,
-                "ocrCandidates": recognized], options: [.sortedKeys, .prettyPrinted]).write(to: file, options: .atomic)
+                "ocrCandidates": recognized], options: [.sortedKeys, .prettyPrinted])
+            let file = try AutomationStepLog.writeDiagnostic(
+                root: logRoot, folder: .transfer, name: "menu-lookup-\(UUID().uuidString).json", data: data
+            )
             AutomationStepLog.record(root: logRoot, uid: uid, step: "transfer-menu-lookup-missed",
                 detail: "phase=\(phase) attempt=\(attempt)/4 diagnostics=\(file.path)")
         } catch {

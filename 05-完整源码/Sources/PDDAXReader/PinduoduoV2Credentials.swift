@@ -1,9 +1,11 @@
+import Darwin
 import Foundation
 
 enum PinduoduoV2CredentialError: LocalizedError, Equatable {
     case missing([String])
     case unreadable(String)
     case malformed(String)
+    case invalidKey
 
     var errorDescription: String? {
         switch self {
@@ -16,6 +18,8 @@ enum PinduoduoV2CredentialError: LocalizedError, Equatable {
             return BilingualText.lines("无法读取密钥文件：\(path)", "The credential file is unreadable: \(path)")
         case .malformed(let path):
             return BilingualText.lines("密钥文件格式无效：\(path)", "The credential file is malformed: \(path)")
+        case .invalidKey:
+            return BilingualText.lines("请输入一行有效的 API 密钥。", "Enter a single API key without spaces.")
         }
     }
 }
@@ -43,6 +47,7 @@ struct PinduoduoV2EnvironmentCredentialProvider: PinduoduoV2CredentialProviding,
         if let configured = environment["PINDUODUO_ENV_FILE"], !configured.isEmpty {
             values.append(URL(fileURLWithPath: configured))
         }
+        values.append(Self.configurationURL(homeDirectory: homeDirectory))
         values.append(currentDirectory.appendingPathComponent(".env"))
         values.append(currentDirectory.deletingLastPathComponent().appendingPathComponent(".env"))
         var bundleAncestor = bundleURL.deletingLastPathComponent()
@@ -52,9 +57,47 @@ struct PinduoduoV2EnvironmentCredentialProvider: PinduoduoV2CredentialProviding,
             if parent.path == bundleAncestor.path { break }
             bundleAncestor = parent
         }
-        values.append(homeDirectory.appendingPathComponent("Library/Application Support/PDDAutoReplyShared/.env"))
         var seen = Set<String>()
         self.candidateURLs = values.filter { seen.insert($0.standardizedFileURL.path).inserted }
+    }
+
+    private static func configurationURL(homeDirectory: URL) -> URL {
+        homeDirectory.appendingPathComponent("Library/Application Support/PDDAutoReplyShared/.env")
+    }
+
+    static func saveAPIKey(_ input: String, homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) throws {
+        let key = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        let invalid = CharacterSet.whitespacesAndNewlines.union(.controlCharacters)
+        guard !key.isEmpty, key.rangeOfCharacter(from: invalid) == nil else {
+            throw PinduoduoV2CredentialError.invalidKey
+        }
+
+        let files = FileManager.default
+        let destination = configurationURL(homeDirectory: homeDirectory)
+        let folder = destination.deletingLastPathComponent()
+        try files.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        var lines: [String] = []
+        if files.fileExists(atPath: destination.path) {
+            let existing = try String(contentsOf: destination, encoding: .utf8)
+            lines = existing.split(whereSeparator: \Character.isNewline).map(String.init).filter { line in
+                var name = line.prefix { $0 != "=" }.trimmingCharacters(in: .whitespaces)
+                if name.hasPrefix("export ") {
+                    name = String(name.dropFirst(7)).trimmingCharacters(in: .whitespaces)
+                }
+                return name != variableName
+            }
+        }
+        lines.append("\(variableName)=\"\(key)\"")
+
+        let staging = folder.appendingPathComponent(".credential-\(UUID().uuidString)", isDirectory: true)
+        try files.createDirectory(at: staging, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        defer { try? files.removeItem(at: staging) }
+        let temporary = staging.appendingPathComponent(".env")
+        try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: temporary)
+        try files.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporary.path)
+        guard rename(temporary.path, destination.path) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
     }
 
     func apiKey() throws -> String {
