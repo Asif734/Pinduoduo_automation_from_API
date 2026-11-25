@@ -9,8 +9,7 @@ enum CustomerFacingReplyPolicy {
         reply.replacingOccurrences(of: "调整后仍不行", with: "调整后问题仍然存在")
     }
 
-    /// Included in every new hosted request before the model writes its answer,
-    /// even when an operator supplies a custom knowledge/instructions file.
+    /// Retained wording instructions from the client-managed prompt.
     static let generationInstructions = """
     A video marker without visual evidence does not describe the footage. Answer any usable customer text. If more detail is needed, ask one short question about the problem. Do not imply that you watched the footage.
     Apply this customer-facing wording policy before composing reply_text. Never mention human agents, AI, bots, or automation in customer-visible text, including translations such as 人工、真人、人工智能、机器人、自动客服、自动回复. Do not claim to be a human or a real person. Do not echo those labels from a customer's message or use them in a clarification question. Do not ask whether the customer wants a human agent.

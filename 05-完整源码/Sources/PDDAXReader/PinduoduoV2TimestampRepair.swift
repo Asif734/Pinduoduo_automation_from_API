@@ -5,11 +5,6 @@ import Foundation
 /// previously synchronized data proves that timestamps alone were wrong.
 /// Pending execution, uncertain sends, changed text and media are excluded.
 enum PinduoduoV2TimestampRepair {
-    private struct Instructions: PinduoduoV2ReplyInstructionsProviding {
-        let value: String
-        func instructions() throws -> String { value }
-    }
-
     static func replacement(for job: AutoReplyJob, root: URL) throws -> UUID? {
         let store = PinduoduoV2GenerationOutboxStore(rootDirectory: root)
         guard !job.sendWasInvoked, job.deliveryOutcome == .notSent,
@@ -41,8 +36,8 @@ enum PinduoduoV2TimestampRepair {
             String(hex[hex.index(hex.startIndex, offsetBy: range.lowerBound)..<hex.index(hex.startIndex, offsetBy: range.upperBound)])
         }
         let id = UUID(uuidString: parts.joined(separator: "-"))!
-        let corrected = try PinduoduoV2RequestBuilder(rootDirectory: root,
-            instructionsProvider: Instructions(value: request.replyInstructions)).freeze(localJobID: id, capture: job.capture)
+        let corrected = try PinduoduoV2RequestBuilder(rootDirectory: root)
+            .freeze(localJobID: id, capture: job.capture)
         let newRequest = try JSONDecoder().decode(PinduoduoV2ReplyRequest.self, from: corrected.requestJSON)
         guard corrected.files.isEmpty, newRequest.media.isEmpty,
               Set(newRequest.targetMessageIds) == Set(request.targetMessageIds),

@@ -24,45 +24,42 @@ final class PinduoduoV2IntegrationTests: XCTestCase {
         let request = try JSONDecoder().decode(PinduoduoV2ReplyRequest.self, from: frozen.requestJSON)
         XCTAssertEqual(request.messages.map(\.id), [oldTarget.id, recent.id, current.id])
         XCTAssertEqual(Set(request.targetMessageIds), [oldTarget.id, current.id])
+        XCTAssertTrue(request.replyInstructions.isEmpty, "The backend supplies the policy for new requests")
     }
 
-    func testEveryNewFrozenRequestIncludesWordingPolicyBeforeGeneration() throws {
+    func testExistingFrozenRequestKeepsItsOriginalPromptWhenRetried() throws {
         let root = temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
         let capture = try makeCapture(uid: "customer", messages: [message("q", .customer, "转亭子", seconds: 0)], targets: ["q"])
         let id = UUID()
-        let builder = PinduoduoV2RequestBuilder(rootDirectory: root,
-            instructionsProvider: FixedV2Instructions(value: "Use the approved product facts."))
+        let builder = PinduoduoV2RequestBuilder(rootDirectory: root)
         let record = try builder.freeze(localJobID: id, capture: capture)
-        let request = try JSONDecoder().decode(PinduoduoV2ReplyRequest.self, from: record.requestJSON)
-        XCTAssertTrue(request.replyInstructions.contains("Use the approved product facts."))
-        XCTAssertTrue(request.replyInstructions.contains("Never mention human agents, AI, bots, or automation"))
-        XCTAssertTrue(request.replyInstructions.contains("您想咨询什么问题？我来帮您看看。"))
-        XCTAssertTrue(request.replyInstructions.contains("Do not ask whether the customer wants a human agent"))
-        let repeated = try PinduoduoV2RequestBuilder(rootDirectory: root,
-            instructionsProvider: FixedV2Instructions(value: "Different policy after submission"))
-            .freeze(localJobID: id, capture: capture)
-        XCTAssertEqual(repeated.requestJSON, record.requestJSON)
+        var request = try XCTUnwrap(JSONSerialization.jsonObject(with: record.requestJSON) as? [String: Any])
+        XCTAssertEqual(request["replyInstructions"] as? String, "")
+        request["replyInstructions"] = "Previously submitted policy"
+        let legacy = PinduoduoV2GenerationOutboxRecord(
+            localJobID: id, customerUid: record.customerUid, historyVersion: record.historyVersion,
+            idempotencyKey: record.idempotencyKey, requestJSON: try JSONSerialization.data(withJSONObject: request),
+            files: record.files, messageFingerprints: record.messageFingerprints, mediaFingerprints: record.mediaFingerprints,
+            createdAt: record.createdAt, phase: .accepted, hostedJobID: "existing-job"
+        )
+        try PinduoduoV2GenerationOutboxStore(rootDirectory: root).save(legacy)
+
+        let repeated = try builder.freeze(localJobID: id, capture: capture)
+        XCTAssertEqual(repeated.requestJSON, legacy.requestJSON)
+        XCTAssertEqual(repeated.idempotencyKey, legacy.idempotencyKey)
+        XCTAssertEqual(repeated.hostedJobID, legacy.hostedJobID)
     }
 
-    func testBundledMerchantPolicyReachesHostedRequestsWithExamplesAndFitsLimit() throws {
-        let root = temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+    func testBundledMerchantPolicyKeptForReference() throws {
         let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent()
         let policy = project.appendingPathComponent("Resources/CustomerService/pinduoduo-v2-reply-instructions.txt")
-        let builder = PinduoduoV2RequestBuilder(rootDirectory: root,
-            instructionsProvider: PinduoduoV2ReplyInstructionsFileProvider(candidates: [policy]))
-        let capture = try makeCapture(uid: "merchant-policy", messages: [
-            message("q", .customer, "找不到速印通", seconds: 0)
-        ], targets: ["q"])
-        let record = try builder.freeze(localJobID: UUID(), capture: capture)
-        let request = try JSONDecoder().decode(PinduoduoV2ReplyRequest.self, from: record.requestJSON)
-
-        XCTAssertTrue(request.replyInstructions.contains("如果调整后问题仍然存在，请先暂停试打。"))
-        XCTAssertTrue(request.replyInstructions.contains("请问您之前是从哪里下载安装包的？我们先确认来源，再继续安装。"))
-        XCTAssertTrue(request.replyInstructions.contains("Keep contact and payments within Pinduoduo"))
-        XCTAssertTrue(request.replyInstructions.contains("Never tie money, coupons, gifts, or other benefits to a review"))
-        XCTAssertLessThanOrEqual(request.replyInstructions.utf8.count, 16_384)
+        let instructions = try PinduoduoV2ReplyInstructionsFileProvider(candidates: [policy]).instructions()
+        XCTAssertTrue(instructions.contains("如果调整后问题仍然存在，请先暂停试打。"))
+        XCTAssertTrue(instructions.contains("请问您之前是从哪里下载安装包的？我们先确认来源，再继续安装。"))
+        XCTAssertTrue(instructions.contains("Keep contact and payments within Pinduoduo"))
+        XCTAssertTrue(instructions.contains("Never tie money, coupons, gifts, or other benefits to a review"))
+        XCTAssertLessThanOrEqual(instructions.utf8.count, 16_384)
     }
 
     func testGenerationFinishesObservedIdentityRepliesAsNeutralHelpWithoutParking() async throws {
@@ -572,18 +569,17 @@ final class PinduoduoV2IntegrationTests: XCTestCase {
             .freeze(localJobID: UUID(), capture: capture))
     }
 
-    func testBuilderRejectsEmptyAndOversizedInstructionsBeforeWritingOutbox() throws {
+    func testRetainedPromptLoaderValidatesEmptyAndOversizedFiles() throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
-        let capture = try makeCapture(uid: "GZC-301", messages: [
-            message("middlePanel_list_q", .customer, "hello", seconds: 0)
-        ], targets: ["middlePanel_list_q"])
-        XCTAssertThrowsError(try PinduoduoV2RequestBuilder(
-            rootDirectory: root, instructionsProvider: FixedV2Instructions(value: "  \n")
-        ).freeze(localJobID: UUID(), capture: capture))
-        XCTAssertThrowsError(try PinduoduoV2RequestBuilder(
-            rootDirectory: root, instructionsProvider: FixedV2Instructions(value: String(repeating: "界", count: 5_462))
-        ).freeze(localJobID: UUID(), capture: capture))
+        let legacyFile = root.appendingPathComponent("unavailable-legacy-policy.txt")
+        let policy = PinduoduoV2ReplyInstructionsFileProvider(candidates: [legacyFile])
+        XCTAssertThrowsError(try policy.instructions())
+
+        try Data("  \n".utf8).write(to: legacyFile)
+        XCTAssertThrowsError(try policy.instructions())
+        try Data(String(repeating: "界", count: 5_462).utf8).write(to: legacyFile)
+        XCTAssertThrowsError(try policy.instructions())
     }
 
     func testSynchronizedMessageIDCannotBeChangedButIdenticalTextWithNewIDRemainsNewEvent() throws {
@@ -1114,11 +1110,6 @@ private final class TimestampRepairDriver: AutoReplyAutomationDriver {
 private struct FixedV2Credential: PinduoduoV2CredentialProviding {
     let value: String
     func apiKey() throws -> String { value }
-}
-
-private struct FixedV2Instructions: PinduoduoV2ReplyInstructionsProviding {
-    let value: String
-    func instructions() throws -> String { value }
 }
 
 private final class RecordingV2Transport: PinduoduoV2Transporting, @unchecked Sendable {

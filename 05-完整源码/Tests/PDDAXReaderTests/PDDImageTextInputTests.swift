@@ -280,9 +280,8 @@ final class PDDImageTextInputTests: XCTestCase {
         let generated = await generator.recorded(); XCTAssertEqual(generated, [["photo"]])
     }
 
-    private struct Instructions: PinduoduoV2ReplyInstructionsProviding { func instructions() throws -> String { "Answer the supplied customer image and its related text together." } }
     private func builder(_ root: URL) -> PinduoduoV2RequestBuilder {
-        .init(rootDirectory: root, now: { Date(timeIntervalSince1970: 1_000) }, instructionsProvider: Instructions())
+        .init(rootDirectory: root, now: { Date(timeIntervalSince1970: 1_000) })
     }
     private func temporary() -> URL {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

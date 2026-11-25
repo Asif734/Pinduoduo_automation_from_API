@@ -261,13 +261,10 @@ struct PinduoduoV2ReplyInstructionsFileProvider: PinduoduoV2ReplyInstructionsPro
 struct PinduoduoV2RequestBuilder: Sendable {
     let rootDirectory: URL
     let now: @Sendable () -> Date
-    let instructionsProvider: any PinduoduoV2ReplyInstructionsProviding
 
-    init(rootDirectory: URL, now: @escaping @Sendable () -> Date = { Date() },
-         instructionsProvider: any PinduoduoV2ReplyInstructionsProviding = PinduoduoV2ReplyInstructionsFileProvider()) {
+    init(rootDirectory: URL, now: @escaping @Sendable () -> Date = { Date() }) {
         self.rootDirectory = rootDirectory
         self.now = now
-        self.instructionsProvider = instructionsProvider
     }
 
     func freeze(localJobID: UUID, capture: AutoReplyCapture) throws -> PinduoduoV2GenerationOutboxRecord {
@@ -277,13 +274,15 @@ struct PinduoduoV2RequestBuilder: Sendable {
         let outbox = PinduoduoV2GenerationOutboxStore(rootDirectory: rootDirectory)
         if let existing = try outbox.load(localJobID) { return existing }
 
-        let configuredInstructions = try instructionsProvider.instructions()
+        let requestTime = now()
+        let cutoff = requestTime.addingTimeInterval(-48 * 60 * 60)
+        // The hosted backend supplies the prompt. Retain the previous client assembly for reference.
+        /*
+        let configuredInstructions = try PinduoduoV2ReplyInstructionsFileProvider().instructions()
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !configuredInstructions.isEmpty else {
             throw PinduoduoV2ClientError.invalidConfiguration("Pinduoduo V2 reply instructions are empty")
         }
-        let requestTime = now()
-        let cutoff = requestTime.addingTimeInterval(-48 * 60 * 60)
         let contextInstructions = "Use the explicit target messages and conversation context dated at or after \(PinduoduoV2DateCodec.string(cutoff)). Ignore any older context retained by the service."
         let instructions = [configuredInstructions, CustomerFacingReplyPolicy.generationInstructions, contextInstructions]
             .joined(separator: "\n\n")
@@ -292,6 +291,7 @@ struct PinduoduoV2RequestBuilder: Sendable {
                 "Pinduoduo V2 reply instructions exceed 16,384 UTF-8 bytes"
             )
         }
+        */
         let ledger = PinduoduoV2HistoryLedger(rootDirectory: rootDirectory, customerUID: capture.uid)
         let synchronized = try ledger.snapshot()
         let futureLimit = requestTime.addingTimeInterval(5 * 60)
@@ -484,7 +484,7 @@ struct PinduoduoV2RequestBuilder: Sendable {
             targetMessageIds: targetIDs,
             referencedMediaIds: referencedMediaIDs.isEmpty ? nil : referencedMediaIDs,
             media: manifest,
-            replyInstructions: instructions
+            replyInstructions: ""
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
