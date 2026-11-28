@@ -25,12 +25,14 @@ struct PDDVerifiedCaptureInbox {
         guard entry.uid == uid else { throw PerUserAXStoreError.invalidUID }
         return entry.acknowledged == true && !includingAcknowledged ? nil : entry
     }
-    func entries(includingAcknowledged: Bool = false) throws -> [Entry] {
+    func entries(includingAcknowledged: Bool = false, matchingUIDs: Set<String>? = nil) throws -> [Entry] {
         guard FileManager.default.fileExists(atPath: directory.path) else { return [] }
         return try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
             .filter { $0.pathExtension == "json" }.compactMap { path -> Entry? in
+                let uid = path.deletingPathExtension().lastPathComponent
+                guard matchingUIDs?.contains(uid) ?? true else { return nil }
                 // A corrupt customer's inbox must not prevent scanning other customers.
-                do { return try load(uid: path.deletingPathExtension().lastPathComponent, includingAcknowledged: includingAcknowledged) }
+                do { return try load(uid: uid, includingAcknowledged: includingAcknowledged) }
                 catch {
                     AutomationStepLog.record(root: root, uid: nil, step: "capture-inbox-read-deferred", detail: "file=\(path.lastPathComponent) \(error.localizedDescription)")
                     return nil

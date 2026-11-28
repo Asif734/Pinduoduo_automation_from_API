@@ -186,7 +186,12 @@ enum PDDAXControlSelection {
         in nodes: [PDDAXSemanticNode<ID>]
     ) throws -> [PDDOrdinaryTransferAction<ID>] {
         try ordinaryTransferActions(in: nodes).filter { action in
-            action.routingLabels.contains { label in
+            // The main account is ineligible even if AX associates an after-sales remark with its row.
+            guard !action.routingLabels.contains(where: { label in
+                let accountName = label.split(maxSplits: 1, whereSeparator: { $0 == ":" || $0 == "：" }).first
+                return accountName?.trimmingCharacters(in: .whitespacesAndNewlines) == "主账号"
+            }) else { return false }
+            return action.routingLabels.contains { label in
                 label.contains("售后")
                     || label.range(of: #"after[\s-]*sales?"#,
                                    options: [.regularExpression, .caseInsensitive]) != nil

@@ -83,6 +83,21 @@ final class PDDOCRCaptureTests: XCTestCase {
         XCTAssertFalse(raised)
     }
 
+    func testForegroundActivationRaisesWorkbenchWhenAnotherPDDWindowIsFocused() async throws {
+        var requested = false
+        var workbenchFocused = false
+        try await PDDWindowForegroundActivation.run(
+            request: { requested = true; return true },
+            raise: { workbenchFocused = true; return true },
+            isFrontmost: { true },
+            isTargetWindowFocused: { workbenchFocused },
+            sleep: { _ in }
+        )
+
+        XCTAssertFalse(requested, "PDD is already in the foreground")
+        XCTAssertTrue(workbenchFocused, "An image preview or notification window cannot authorize the video click")
+    }
+
     func testForegroundActivationFailsWhenExactWindowCannotBeRaised() async {
         do {
             try await PDDWindowForegroundActivation.run(

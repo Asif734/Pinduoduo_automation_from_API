@@ -403,10 +403,11 @@ struct PinduoduoV2RequestBuilder: Sendable {
             }
             return message.capturedAt >= cutoff
         }
-        // Reserve space for the complete target batch and its speech before
-        // retaining older context; never truncate speech to fit the window.
+        // Keep the latest five unsynced context rows after reserving room
+        // for every current target and its speech.
+        let contextLimit = min(5, 100 - requiredIDs.count)
         let contextIDs = Set(eligible.filter { !requiredIDs.contains($0.id) }
-            .suffix(100 - requiredIDs.count).map(\.id))
+            .suffix(contextLimit).map(\.id))
         let selected = eligible.filter { requiredIDs.contains($0.id) || contextIDs.contains($0.id) }
         guard requiredIDs.isSubset(of: Set(selected.map(\.id))) else {
             throw PinduoduoV2ClientError.invalidRequest("Target messages do not fit in the 100-message request limit")

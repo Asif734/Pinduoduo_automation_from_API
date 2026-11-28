@@ -1597,7 +1597,8 @@ private final class ConversationVideoArmerStub: PDDVideoTransferArming {
     }
 
     func arm(
-        uid: String, messageID: String, candidate: PDDCustomerVideoCandidate
+        uid: String, messageID: String, candidate: PDDCustomerVideoCandidate,
+        verifyNetworkPreview: @escaping PDDVideoPreviewVerification
     ) async throws -> ArmedPDDVideoTransfer? {
         candidates.append(candidate)
         return ArmedPDDVideoTransfer(operation: operation)

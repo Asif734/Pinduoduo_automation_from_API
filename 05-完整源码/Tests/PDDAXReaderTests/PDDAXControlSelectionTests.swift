@@ -25,6 +25,34 @@ final class PDDAXControlSelectionTests: XCTestCase {
         ]
         XCTAssertEqual(try PDDAXControlSelection.afterSalesTransferActions(in: nodes).map(\.controlID), ["control"])
     }
+
+    func testExcludesMainAccountEvenWhenItsRowContainsAfterSalesText() throws {
+        let accounts = [
+            ("主账号", "售后"),
+            ("主账号： 主账号", "After-sales service"),
+            ("格志打印小赵", "售后After-salesservice"),
+            ("格志打印机小七", "售后 王梅After-sales service"),
+            ("格志打印机西西", "售后 叶定英After-sales service"),
+            ("格志打印机初一", "售前 张晓坤")
+        ]
+        var nodes = [
+            node("dialog", role: "AXGroup", value: "转移会话"),
+            node("search", parent: "dialog", role: "AXTextField", value: "请输入内容", settable: true)
+        ]
+        for (index, account) in accounts.enumerated() {
+            let row = "row-\(index)"
+            nodes += [
+                node(row, parent: "dialog", role: "AXRow"),
+                node("name-\(index)", parent: row, role: "AXStaticText", value: account.0),
+                node("remark-\(index)", parent: row, role: "AXStaticText", value: account.1),
+                node("transfer-\(index)", parent: row, role: "AXGroup", value: "转移",
+                     frame: .init(x: 500, y: 140 + 40 * index, width: 48, height: 24))
+            ]
+        }
+        let eligible = try PDDAXControlSelection.afterSalesTransferActions(in: nodes)
+        XCTAssertEqual(eligible.map(\.agentLabel), ["格志打印小赵", "格志打印机小七", "格志打印机西西"])
+    }
+
     func testSelectsOnlyComposerUnderChatPanel() throws {
         XCTAssertEqual(try PDDAXControlSelection.composer(in: fixtureNodes), "composer")
     }

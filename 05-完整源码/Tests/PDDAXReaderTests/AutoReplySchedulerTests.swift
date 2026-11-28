@@ -1984,10 +1984,8 @@ final class AutoReplySchedulerTests: XCTestCase {
         XCTAssertTrue(f.scheduler.pendingVideoBatchesSnapshot.isEmpty)
         XCTAssertEqual(f.scheduler.jobs.count, 1)
         XCTAssertEqual(f.scheduler.jobs[0].state, .ready)
-        XCTAssertEqual(
-            f.scheduler.jobs[0].reply,
-            CustomerFacingFallback.productProblemQuestion(history: f.scheduler.jobs[0].capture.fullHistory)
-        )
+        let reply = try XCTUnwrap(f.scheduler.jobs[0].reply)
+        XCTAssertTrue(CustomerFacingFallback.productProblemQuestions.contains(reply))
     }
 
     func testLaterRecoveredVideoResolvesOriginalPendingBatchExactlyOnce() async throws {
@@ -3824,7 +3822,7 @@ private func makeVideoCapture(
 }
 
 @MainActor
-private final class ControlledAutoReplyDriver: AutoReplyAutomationDriver {
+final class ControlledAutoReplyDriver: AutoReplyAutomationDriver {
     func transferHostedFailure(uid: String, expectedCustomerMessageIDs: Set<String>,
                                lease: UIOperationLease) async throws -> AutoReplyTransferResult {
         XCTAssertFalse(expectedCustomerMessageIDs.isEmpty)

@@ -126,9 +126,18 @@ final class PDDAXConversationDriver: PDDConversationOpening {
 
     private var captureInbox: PDDVerifiedCaptureInbox { .init(root: chatStore.rootDirectory) }
 
-    private func pendingInboxEntries(includeReceiptRecovery: Bool = false) throws -> [PDDVerifiedCaptureInbox.Entry] {
+    private func pendingInboxEntries(includeReceiptRecovery: Bool = false,
+                                     matchingUIDs: Set<String>? = nil) throws -> [PDDVerifiedCaptureInbox.Entry] {
+        var inboxUIDs = matchingUIDs
+        if let matchingUIDs {
+            for alias in try identities.aliases().keys {
+                if let owner = try? identities.canonicalUID(alias), matchingUIDs.contains(owner) {
+                    inboxUIDs?.insert(alias)
+                }
+            }
+        }
         var entries: [String: PDDVerifiedCaptureInbox.Entry] = [:]
-        for entry in try captureInbox.entries(includingAcknowledged: includeReceiptRecovery) {
+        for entry in try captureInbox.entries(includingAcknowledged: includeReceiptRecovery, matchingUIDs: inboxUIDs) {
             do {
                 let uid = try identities.canonicalUID(entry.uid)
                 if entry.acknowledged == true {
@@ -147,6 +156,21 @@ final class PDDAXConversationDriver: PDDConversationOpening {
             }
         }
         return entries.values.sorted { $0.capturedAt < $1.capturedAt }
+    }
+
+    func verifiedTextCaptureUIDs(after cursors: [String: AutoReplyCursor]) -> Set<String> {
+        guard let entries = try? pendingInboxEntries(includeReceiptRecovery: true, matchingUIDs: Set(cursors.keys)) else {
+            return []
+        }
+        return Set(entries.compactMap { entry -> String? in
+            guard let cursor = cursors[entry.uid], isAllowed(entry.uid),
+                  baselinedUIDs.contains(entry.uid) || cursor != .empty || entry.unread,
+                  PDDAXIncomingTransfer.unansweredHandoff(in: entry.snapshot.replay) == nil,
+                  let batch = try? stagedBatch(entry, after: cursor),
+                  !batch.events.isEmpty,
+                  batch.events.allSatisfy({ $0.kind == .text || $0.kind == .link }) else { return nil }
+            return entry.uid
+        })
     }
 
     func discover() async throws -> [AutoReplyDiscovery] {
@@ -1109,6 +1133,22 @@ final class PDDAXConversationDriver: PDDConversationOpening {
         )
     }
 
+    private func stagedBatch(_ entry: PDDVerifiedCaptureInbox.Entry, after cursor: AutoReplyCursor) throws -> FrozenCustomerBatch? {
+        let combined = PDDVerifiedCaptureInbox.merging(try chatStore.loadAXFirst(uid: entry.uid), entry.messages)
+        let timeline = try AutoReplyTimeline.make(messages: combined)
+        let prefix = Array(combined.prefix((combined.lastIndex { $0.sender == .service }).map { $0 + 1 } ?? 0))
+        let serviceCursor = try AutoReplyTimeline.make(messages: prefix).cursor
+        let start = !baselinedUIDs.contains(entry.uid) && cursor == .empty ? serviceCursor : cursor
+        do { return try timeline.freeze(after: start) }
+        catch AutoReplyTimelineError.invalidPrefix {
+            // Match capture's cursor recovery so earlier media is still included when required.
+            guard let recovered = timeline.prefixCursor(at: min(start.count, serviceCursor.count)) else {
+                throw AutoReplyTimelineError.invalidPrefix
+            }
+            return try timeline.freeze(after: recovered)
+        }
+    }
+
     private func capture(
         uid: String,
         after cursor: AutoReplyCursor,
@@ -1123,19 +1163,7 @@ final class PDDAXConversationDriver: PDDConversationOpening {
         let staged = useInbox ? try pendingInboxEntries(includeReceiptRecovery: true).first(where: { $0.uid == uid }) : nil
         var needsLiveMedia = onlyVideoMessageID != nil
         if let staged, enrichAttachments {
-            let combined = PDDVerifiedCaptureInbox.merging(try chatStore.loadAXFirst(uid: uid), staged.messages)
-            let timeline = try AutoReplyTimeline.make(messages: combined)
-            let prefix = Array(combined.prefix((combined.lastIndex { $0.sender == .service }).map { $0 + 1 } ?? 0))
-            let serviceCursor = try AutoReplyTimeline.make(messages: prefix).cursor
-            let start = !baselinedUIDs.contains(uid) && cursor == .empty ? serviceCursor : cursor
-            let mediaBatch: FrozenCustomerBatch?
-            do { mediaBatch = try timeline.freeze(after: start) }
-            catch AutoReplyTimelineError.invalidPrefix {
-                // Match the capture cursor recovery below; never skip media
-                // merely because the old cursor is no longer a valid prefix.
-                guard let recovered = timeline.prefixCursor(at: min(start.count, serviceCursor.count)) else { throw AutoReplyTimelineError.invalidPrefix }
-                mediaBatch = try timeline.freeze(after: recovered)
-            }
+            let mediaBatch = try stagedBatch(staged, after: cursor)
             needsLiveMedia = needsLiveMedia || mediaBatch?.events.contains { $0.kind == .image || $0.kind == .video } == true
         }
         var openedTree: PDDAXSemanticTree

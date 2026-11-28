@@ -6,6 +6,7 @@ PROJECT_ROOT="${SCRIPT_DIR:h}"
 APP_PATH="$PROJECT_ROOT/outputs/拼多多AX读取器.app"
 PROBE_APP_PATH="$PROJECT_ROOT/outputs/拼多多AX单次解析测试器.app"
 AUTO_REPLY_APP_PATH="$PROJECT_ROOT/outputs/拼多多全自动客服.app"
+AUTO_REPLY_INFO="$PROJECT_ROOT/Resources/AutoReplyInfo.plist"
 CANDIDATE_APP_PATH="$PROJECT_ROOT/outputs/pinduodou_automation.app"
 INSTALLED_APP_PATH="/Applications/${AUTO_REPLY_APP_PATH:t}"
 SIGNING_IDENTITY="$($PROJECT_ROOT/scripts/select_codesign_identity.sh)"
@@ -74,6 +75,9 @@ case "$#:${1:-}" in
 esac
 
 mkdir -p "$PROJECT_ROOT/outputs"
+zmodload zsh/system
+touch "$PROJECT_ROOT/outputs/.pdd-build.lock"
+zsystem flock "$PROJECT_ROOT/outputs/.pdd-build.lock"
 APP_STAGING_ROOT="$(/usr/bin/mktemp -d "$PROJECT_ROOT/outputs/.pdd-app-build.XXXXXX")"
 trap '/bin/rm -rf -- "$APP_STAGING_ROOT"' EXIT
 
@@ -144,7 +148,18 @@ sign_and_verify "$PROBE_APP_PATH"
 staged_app="$APP_STAGING_ROOT/${AUTO_REPLY_APP_PATH:t}"
 mkdir -p "$staged_app/Contents/MacOS" "$staged_app/Contents/Resources"
 cp "$BIN_DIR/PDDAXReader" "$staged_app/Contents/MacOS/PDDAutoReply"
-cp "$PROJECT_ROOT/Resources/AutoReplyInfo.plist" "$staged_app/Contents/Info.plist"
+staged_info="$staged_app/Contents/Info.plist"
+cp -p "$AUTO_REPLY_INFO" "$staged_info"
+version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$staged_info")"
+build="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$staged_info")"
+[[ "$version" == <->.<-> && "$build" == <-> ]] || {
+    print -u2 "Expected a major.minor version and numeric build in $AUTO_REPLY_INFO"
+    exit 1
+}
+next_version="${version%.*}.$(( ${version##*.} + 1 ))"
+next_build="$(( build + 1 ))"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $next_version" \
+    -c "Set :CFBundleVersion $next_build" "$staged_info"
 copy_auto_reply_resources "$staged_app"
 cmp "$PROJECT_ROOT/Resources/CustomerService/customer-reply-prompt.md" \
     "$staged_app/Contents/Resources/CustomerService/customer-reply-prompt.md"
@@ -161,7 +176,11 @@ else
 fi
 chmod 755 "$staged_app/Contents/MacOS/PDDAutoReply"
 sign_and_verify "$staged_app"
+# Persist the number before publishing so a retry cannot reuse a published version.
+cp -p "$staged_info" "$APP_STAGING_ROOT/AutoReplyInfo.plist"
+mv -f "$APP_STAGING_ROOT/AutoReplyInfo.plist" "$AUTO_REPLY_INFO"
 /bin/zsh "$SCRIPT_DIR/replace_app_bundle.sh" "$staged_app" "$AUTO_REPLY_APP_PATH"
+print "Auto-reply version $next_version (build $next_build)"
 
 if [[ "${1:-}" == "--install" ]]; then
     /bin/zsh "$SCRIPT_DIR/replace_app_bundle.sh" "$staged_app" "$INSTALLED_APP_PATH"

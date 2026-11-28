@@ -7,8 +7,10 @@ final class PDDVideoTransferArmerTests: XCTestCase {
         guard let messageID = ProcessInfo.processInfo.environment["PDD_LIVE_VIDEO_CAPTURE_MESSAGE_ID"] else {
             throw XCTSkip("Set PDD_LIVE_VIDEO_CAPTURE_MESSAGE_ID for a capture-only local video check")
         }
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let sandbox = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let root = sandbox.appendingPathComponent("videos")
         let backend = LivePDDAXBackend()
         let tree = try backend.readSemanticTree()
         let candidate = try XCTUnwrap(PDDAXVideoSelection.customerVideos(in: tree.nodes, messageIDs: [messageID]).first)
@@ -34,6 +36,9 @@ final class PDDVideoTransferArmerTests: XCTestCase {
         XCTAssertEqual(attachment.messageID, messageID)
         XCTAssertFalse(attachment.frames.isEmpty)
         XCTAssertTrue(FileManager.default.fileExists(atPath: attachment.localURL.path))
+        let log = try String(contentsOf: sandbox.appendingPathComponent("logs/automation-steps.jsonl"))
+        let source = log.contains("source=network") ? "network" : "cache"
+        print("CAPTURE-ONLY source=\(source); audio=\(attachment.audioCodec ?? "none"); frames=\(attachment.frames.count)")
     }
 
     func testFailedVideoAsksProductProblemImmediatelyAndOnlyOnceAcrossRestart() async throws {
@@ -257,11 +262,12 @@ private final class VideoArmerSpy: PDDVideoTransferArming {
     var failedMessageIDs: [String] = []
     init(recorder: VideoOrderRecorder) { self.recorder = recorder }
     func arm(
-        uid: String, messageID: String, candidate: PDDCustomerVideoCandidate
+        uid: String, messageID: String, candidate: PDDCustomerVideoCandidate,
+        verifyNetworkPreview: @escaping PDDVideoPreviewVerification
     ) async throws -> ArmedPDDVideoTransfer? {
         recorder.append("arm")
         return ArmedPDDVideoTransfer(
-            onStart: { [recorder] in recorder.append("start") },
+            onStart: { [recorder] _ in recorder.append("start") },
             operation: {}
         )
     }
@@ -287,11 +293,12 @@ private final class WaitingVideoArmerSpy: PDDVideoTransferArming {
     }
 
     func arm(
-        uid: String, messageID: String, candidate: PDDCustomerVideoCandidate
+        uid: String, messageID: String, candidate: PDDCustomerVideoCandidate,
+        verifyNetworkPreview: @escaping PDDVideoPreviewVerification
     ) async throws -> ArmedPDDVideoTransfer? {
         recorder.append("arm")
         return ArmedPDDVideoTransfer(
-            onStart: { [recorder, started] in
+            onStart: { [recorder, started] _ in
                 recorder.append("start")
                 started.fulfill()
             },

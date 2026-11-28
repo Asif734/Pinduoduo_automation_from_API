@@ -5,10 +5,6 @@ import NaturalLanguage
 enum CustomerFacingReplyPolicy {
     static let wordingBlockedMessage = "Pinduoduo wording blocked this draft. Edit the reply in the merchant app."
 
-    static func preparedForPinduoduo(_ reply: String) -> String {
-        reply.replacingOccurrences(of: "调整后仍不行", with: "调整后问题仍然存在")
-    }
-
     /// Retained wording instructions from the client-managed prompt.
     static let generationInstructions = """
     A video marker without visual evidence does not describe the footage. Answer any usable customer text. If more detail is needed, ask one short question about the problem. Do not imply that you watched the footage.
@@ -41,27 +37,26 @@ enum CustomerFacingReplyPolicy {
 }
 
 enum CustomerFacingFallback {
+    static let productProblemQuestions = [
+        "请问您的产品遇到了什么问题？麻烦您描述一下具体表现，我来帮您排查。",
+        "您好，产品使用时出现了什么情况？麻烦说一下具体表现，我帮您看看。",
+        "请问产品是在哪一步出现问题的？您可以说说当时发生了什么。",
+        "请问这个问题是什么时候出现的？方便的话说一下当时在做什么。",
+        "麻烦说一下产品现在的表现，比如无法开机、无法正常使用或有报错，我帮您排查。",
+        "请问这个问题是每次使用都会出现，还是偶尔出现？您可以描述一下具体情况。",
+        "您好，请问产品使用时有哪些异常？如果有提示信息，也可以一起告诉我。",
+        "您能说一下从开始操作到出现问题的过程吗？我根据具体情况帮您排查。",
+        "请问产品是完全无法使用，还是某个功能有问题？您可以先说说最明显的表现。",
+        "麻烦告诉我您原本想完成什么操作，以及产品实际出现了什么情况。",
+        "想帮您尽快找到原因，方便描述一下产品出现问题时的表现吗？"
+    ]
+
     static func productProblemQuestion(history: [PDDChatMessage]) -> String {
-        let recognizer = NLLanguageRecognizer()
-        for message in history.reversed() where message.sender == .customer && message.kind == .text {
-            recognizer.reset(); recognizer.processString(message.content)
-            switch recognizer.dominantLanguage {
-            case .english: return "What problem are you having with the product? Please describe what happens so I can help you troubleshoot."
-            case .spanish: return "¿Qué problema tienes con el producto? Describe qué ocurre para que pueda ayudarte."
-            case .french: return "Quel problème rencontrez-vous avec le produit ? Décrivez ce qui se passe pour que je puisse vous aider."
-            case .german: return "Welches Problem haben Sie mit dem Produkt? Bitte beschreiben Sie, was passiert, damit ich Ihnen helfen kann."
-            case .japanese: return "製品にどのような問題が起きていますか？具体的な症状を教えていただければ、対処方法をご案内します。"
-            case .korean: return "제품에 어떤 문제가 있나요? 구체적인 증상을 설명해 주시면 해결을 도와드리겠습니다."
-            case .bengali: return "পণ্যটিতে কী সমস্যা হচ্ছে? কী ঘটছে তা একটু বর্ণনা করুন, আমি সমাধানে সাহায্য করব।"
-            case .hindi: return "उत्पाद में क्या समस्या आ रही है? कृपया बताएं कि क्या होता है, ताकि मैं मदद कर सकूं।"
-            case .arabic: return "ما المشكلة التي تواجهها مع المنتج؟ يرجى وصف ما يحدث كي أساعدك في حلها."
-            case .portuguese: return "Qual é o problema com o produto? Descreva o que acontece para que eu possa ajudar."
-            case .russian: return "Какая проблема возникла с товаром? Опишите, что происходит, чтобы я мог помочь."
-            case .simplifiedChinese, .traditionalChinese: return "请问您的产品遇到了什么问题？麻烦您描述一下具体表现，我来帮您排查。"
-            default: continue
-            }
-        }
-        return "请问您的产品遇到了什么问题？麻烦您描述一下具体表现，我来帮您排查。"
+        let previous = history.last { message in
+            message.sender == .service && productProblemQuestions.contains(message.content)
+        }?.content
+        let choices = productProblemQuestions.filter { $0 != previous }
+        return choices.randomElement() ?? productProblemQuestions[0]
     }
 
     static func videoQuestion(history: [PDDChatMessage]) -> String {

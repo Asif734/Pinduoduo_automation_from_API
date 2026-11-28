@@ -55,14 +55,17 @@ enum PDDWindowForegroundActivation {
         request: () async throws -> Bool,
         raise: () -> Bool,
         isFrontmost: () -> Bool,
+        isTargetWindowFocused: () -> Bool = { true },
         sleep: (UInt64) async -> Void = { try? await Task.sleep(nanoseconds: $0) }
     ) async throws {
-        if isFrontmost() { return }
-        guard try await request(), raise() else {
+        let appIsFrontmost = isFrontmost()
+        if appIsFrontmost && isTargetWindowFocused() { return }
+        let activationAccepted = appIsFrontmost ? true : try await request()
+        guard activationAccepted, raise() else {
             throw PDDOCRError.capture("无法将拼多多工作台切到前台")
         }
         for attempt in 0...20 {
-            if isFrontmost() {
+            if isFrontmost(), isTargetWindowFocused() {
                 await sleep(150_000_000)
                 return
             }

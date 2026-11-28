@@ -50,6 +50,37 @@ final class PinduoduoV2IntegrationTests: XCTestCase {
         XCTAssertEqual(repeated.hostedJobID, legacy.hostedJobID)
     }
 
+    func testCapsUnsyncedContextAtFiveForNewAndReturningCustomers() throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let now = Date(timeIntervalSince1970: 1_780_000_000)
+        let builder = PinduoduoV2RequestBuilder(rootDirectory: root, now: { now })
+        let history = (0..<8).map { index in
+            PDDChatMessage(id: "past-\(index)", sender: index.isMultiple(of: 2) ? .service : .customer,
+                           content: "Previous message \(index)", displayTime: nil, kind: .text,
+                           capturedAt: now.addingTimeInterval(Double(index - 30)))
+        }
+        let targets = (0..<2).map { index in
+            PDDChatMessage(id: "new-\(index)", sender: .customer, content: "New message \(index)",
+                           displayTime: nil, kind: .text, capturedAt: now.addingTimeInterval(Double(index - 2)))
+        }
+        let targetIDs = targets.map(\.id)
+        for uid in ["first-time-customer", "returning-customer"] {
+            if uid == "returning-customer" {
+                let previous = try makeCapture(uid: uid, messages: [history[7]], targets: [history[7].id])
+                let accepted = try builder.freeze(localJobID: UUID(), capture: previous)
+                try PinduoduoV2HistoryLedger(rootDirectory: root, customerUID: uid)
+                    .markAccepted(messages: accepted.messageFingerprints, media: accepted.mediaFingerprints)
+            }
+            let capture = try makeCapture(uid: uid, messages: history + targets, targets: targetIDs)
+            let record = try builder.freeze(localJobID: UUID(), capture: capture)
+            let request = try JSONDecoder().decode(PinduoduoV2ReplyRequest.self, from: record.requestJSON)
+            let expectedHistory = uid == "returning-customer" ? history[2...6] : history[3...7]
+            XCTAssertEqual(request.messages.map(\.id), expectedHistory.map(\.id) + targetIDs)
+            XCTAssertEqual(request.targetMessageIds, targetIDs)
+        }
+    }
+
     func testBundledMerchantPolicyKeptForReference() throws {
         let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent()
@@ -62,15 +93,15 @@ final class PinduoduoV2IntegrationTests: XCTestCase {
         XCTAssertLessThanOrEqual(instructions.utf8.count, 16_384)
     }
 
-    func testGenerationFinishesObservedIdentityRepliesAsNeutralHelpWithoutParking() async throws {
-        for (customerText, generated, expected) in [
-            ("转亭子", "您是想转人工客服吗？", "请问您的产品遇到了什么问题？麻烦您描述一下具体表现，我来帮您排查。"),
-            ("在吗", "在的，您刚才是想转人工客服吗？", "请问您的产品遇到了什么问题？麻烦您描述一下具体表现，我来帮您排查。"),
-            ("Can you help me?", "Would you like a human agent?", "What problem are you having with the product? Please describe what happens so I can help you troubleshoot."),
-            ("打印不了", "I am an AI assistant.", "请问您的产品遇到了什么问题？麻烦您描述一下具体表现，我来帮您排查。"),
-            ("打印不了", "我是AI客服。", "请问您的产品遇到了什么问题？麻烦您描述一下具体表现，我来帮您排查。"),
-            ("Please help", "I’m a robot.", "What problem are you having with the product? Please describe what happens so I can help you troubleshoot."),
-            ("Please help", "I am a real person.", "What problem are you having with the product? Please describe what happens so I can help you troubleshoot.")
+    func testGenerationPreservesHostedReplyWording() async throws {
+        for (customerText, generated) in [
+            ("转亭子", "您是想转人工客服吗？"),
+            ("在吗", "在的，您刚才是想转人工客服吗？"),
+            ("Can you help me?", "Would you like a human agent?"),
+            ("打印不了", "I am an AI assistant."),
+            ("打印不了", "我是AI客服。"),
+            ("Please help", "I’m a robot."),
+            ("Please help", "I am a real person.")
         ] {
             let root = temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
             let capture = try makeCapture(uid: "customer", messages: [message("q", .customer, customerText, seconds: 0)], targets: ["q"])
@@ -84,7 +115,7 @@ final class PinduoduoV2IntegrationTests: XCTestCase {
             let transport = RecordingV2Transport(responses: [.success(response(status: 200, body: json(object)))])
             let generator = PinduoduoV2ReplyGenerator(rootDirectory: root, client: .init(transport: transport), credentials: FixedV2Credential(value: "key"))
             let result = try await generator.generate(jobID: id, capture: capture)
-            XCTAssertEqual(result.reply, expected)
+            XCTAssertEqual(result.reply, generated)
             XCTAssertEqual(result.action, .reply)
             XCTAssertEqual(result.transferReason, .none)
             XCTAssertEqual(result.hostedGeneration?.jobId, "existing-job")
@@ -96,7 +127,7 @@ final class PinduoduoV2IntegrationTests: XCTestCase {
         }
     }
 
-    func testMediaOnlyWordingCompletionKeepsPreviousCustomerLanguage() async throws {
+    func testMediaOnlyHostedReplyPreservesAPIWording() async throws {
         let root = temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
         let image = PDDChatMessage(id: "photo", sender: .customer, content: "[图片]", displayTime: nil, kind: .image, capturedAt: Date())
         let capture = try makeCapture(uid: "customer", messages: [message("previous", .customer, "Can you help me with this printer?", seconds: -5), image], targets: ["photo"])
@@ -109,10 +140,10 @@ final class PinduoduoV2IntegrationTests: XCTestCase {
         let transport = RecordingV2Transport(responses: [.success(response(status: 200, body: json(object)))])
         let generator = PinduoduoV2ReplyGenerator(rootDirectory: root, client: .init(transport: transport), credentials: FixedV2Credential(value: "key"))
         let result = try await generator.generate(jobID: id, capture: capture)
-        XCTAssertEqual(result.reply, "What problem are you having with the product? Please describe what happens so I can help you troubleshoot.")
+        XCTAssertEqual(result.reply, "Would you like a human agent?")
     }
 
-    func testGenerationKeepsApprovedTransferActionWithNeutralWording() async throws {
+    @MainActor func testHostedReplySendsVerbatimBeforeTransferWithUnconfirmedDelivery() async throws {
         let root = temporaryDirectory(); defer { try? FileManager.default.removeItem(at: root) }
         let capture = try makeCapture(uid: "customer", messages: [message("q", .customer, "请继续处理售后", seconds: 0)], targets: ["q"])
         let id = UUID()
@@ -120,14 +151,41 @@ final class PinduoduoV2IntegrationTests: XCTestCase {
         record.phase = .accepted; record.hostedJobID = "existing-job"; record.pollURL = "/api/codex/pinduoduo/v2/replies/existing-job?storeId=pinduoduo-default"
         try PinduoduoV2GenerationOutboxStore(rootDirectory: root).save(record)
         var object = try XCTUnwrap(JSONSerialization.jsonObject(with: completedJSON(jobID: "existing-job", uid: "customer", historyVersion: record.historyVersion)) as? [String: Any])
-        var reply = object["reply"] as! [String: Any]
-        reply["reply_text"] = "我帮您转人工客服处理。"; reply["action"] = "reply_then_transfer"; reply["transfer_reason"] = "refund_operation"; object["reply"] = reply
+        let apiText = " 调整后仍不行，我帮您转人工客服处理。\n"
+        var reply = try XCTUnwrap(object["reply"] as? [String: Any])
+        reply["reply_text"] = apiText
+        reply["action"] = "reply_then_transfer"
+        reply["transfer_reason"] = "refund_operation"
+        object["reply"] = reply
         let transport = RecordingV2Transport(responses: [.success(response(status: 200, body: json(object)))])
         let generator = PinduoduoV2ReplyGenerator(rootDirectory: root, client: .init(transport: transport), credentials: FixedV2Credential(value: "key"))
-        let result = try await generator.generate(jobID: id, capture: capture)
-        XCTAssertEqual(result.reply, "我为您转接同事继续协助。")
-        XCTAssertEqual(result.action, .replyThenTransfer)
-        XCTAssertEqual(result.transferReason, .refundOperation)
+        var state = AutoReplyPersistentState.empty
+        state.nextSequence = 1
+        state.jobs = [.init(id: id, uid: capture.uid, sequence: 1, state: .queued,
+            capture: capture, reply: nil, deliveryOutcome: nil, confirmedServiceMessageID: nil,
+            retries: 0, nextAttemptAt: nil, lastError: nil)]
+        let store = AutoReplyStore(rootDirectory: root)
+        try store.save(state)
+        let driver = ControlledAutoReplyDriver(capturesByUID: [:])
+        driver.supportsTextDeliveryTracking = true
+        driver.deliveryResults = [.uncertain("Waiting for PDD confirmation")]
+        driver.beforeSend = { [weak driver] in XCTAssertTrue(driver?.transferredUIDs.isEmpty == true) }
+        let scheduler = try AutoReplyScheduler(driver: driver, generator: generator, store: store,
+            configuredMaximumConcurrentGenerations: 1, availableMemoryBytes: { 8 << 30 })
+        scheduler.start()
+        defer { scheduler.stop() }
+        for _ in 0..<60 {
+            await scheduler.tick()
+            if try store.load().transferTasks.first?.state == .completed { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(driver.sentTexts, [apiText])
+        XCTAssertEqual(driver.transferredUIDs, [capture.uid])
+        XCTAssertEqual(scheduler.jobs.first?.replyAction, .replyThenTransfer)
+        XCTAssertEqual(scheduler.jobs.first?.transferReason, .refundOperation)
+        XCTAssertEqual(scheduler.jobs.first?.deliveryOutcome, .uncertain)
+        XCTAssertNotNil(scheduler.jobs.first?.nextAttemptAt, "Delivery verification stays scheduled")
+        XCTAssertEqual(try store.load().transferTasks.map(\.state), [.completed])
     }
 
     @MainActor func testDefinitiveTimestampConflictGetsOneCorrectedDurableTask() throws {
@@ -374,7 +432,8 @@ final class PinduoduoV2IntegrationTests: XCTestCase {
         let record = try PinduoduoV2RequestBuilder(rootDirectory: root).freeze(localJobID: UUID(), capture: capture)
         let request = try JSONDecoder().decode(PinduoduoV2ReplyRequest.self, from: record.requestJSON)
         let parts = request.messages.filter { $0.id.hasPrefix("video-transcript-") }
-        XCTAssertEqual(request.messages.count, 100)
+        XCTAssertEqual(request.messages.filter { $0.role == .service }.count, 5)
+        XCTAssertEqual(request.messages.count, 8)
         XCTAssertEqual(request.targetMessageIds, ["video-one"])
         XCTAssertEqual(parts.count, 2)
         let restored = parts.map { $0.text.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false).last.map(String.init) ?? "" }.joined()

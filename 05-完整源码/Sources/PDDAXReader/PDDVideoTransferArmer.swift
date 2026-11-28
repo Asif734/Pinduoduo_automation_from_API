@@ -1,17 +1,29 @@
 import Foundation
 
+typealias PDDVideoPreviewVerification = @MainActor @Sendable () async throws -> Bool
+
 final class ArmedPDDVideoTransfer: @unchecked Sendable {
     private let lock = NSLock()
     private var task: Task<Void, Never>?
-    private let onStart: @Sendable () -> Void
+    private let networkLogURL: URL?
+    private var networkCapture: PDDVideoNetworkCapture?
+    private let onStart: @Sendable (PDDVideoNetworkCapture?) -> Void
     private let operation: @Sendable () async -> Void
 
     init(
-        onStart: @escaping @Sendable () -> Void = {},
+        networkLogURL: URL? = nil,
+        onStart: @escaping @Sendable (PDDVideoNetworkCapture?) -> Void = { _ in },
         operation: @escaping @Sendable () async -> Void
     ) {
+        self.networkLogURL = networkLogURL
         self.onStart = onStart
         self.operation = operation
+    }
+
+    func checkpointNetworkBeforeClick() {
+        guard let networkLogURL else { return }
+        let capture = try? PDDVideoNetworkCapture(file: networkLogURL)
+        lock.withLock { networkCapture = capture }
     }
 
     func start() {
@@ -29,9 +41,10 @@ final class ArmedPDDVideoTransfer: @unchecked Sendable {
             return task
         }
         let onStart = self.onStart
+        let networkCapture = self.networkCapture
         let operation = self.operation
         let task = Task.detached(priority: .utility) {
-            onStart()
+            onStart(networkCapture)
             await operation()
         }
         self.task = task
@@ -66,7 +79,8 @@ protocol PDDVideoTransferArming: AnyObject {
     func arm(
         uid: String,
         messageID: String,
-        candidate: PDDCustomerVideoCandidate
+        candidate: PDDCustomerVideoCandidate,
+        verifyNetworkPreview: @escaping PDDVideoPreviewVerification
     ) async throws -> ArmedPDDVideoTransfer?
     func reportFailure(uid: String, messageID: String, error: Error) async
 }
@@ -78,12 +92,25 @@ extension PDDVideoTransferArming {
 @MainActor
 protocol PDDVideoPreviewOpening: AnyObject {
     func open(_ candidate: PDDCustomerVideoCandidate, lease: UIOperationLease) async throws
+    func open(_ candidate: PDDCustomerVideoCandidate, lease: UIOperationLease,
+              beforeClick: @MainActor () -> Void) async throws
     func waitUntilOpen() async throws -> Bool
+    func confirmsNetworkCapture(_ candidate: PDDCustomerVideoCandidate, lease: UIOperationLease) async throws -> Bool
     func close() async
 }
 
 extension PDDVideoPreviewOpening {
+    func open(_ candidate: PDDCustomerVideoCandidate, lease: UIOperationLease,
+              beforeClick: @MainActor () -> Void) async throws {
+        beforeClick()
+        try await open(candidate, lease: lease)
+    }
+
     func waitUntilOpen() async throws -> Bool { true }
+    func confirmsNetworkCapture(_ candidate: PDDCustomerVideoCandidate, lease: UIOperationLease) async throws -> Bool {
+        try lease.validate()
+        return try await waitUntilOpen()
+    }
 }
 
 @MainActor
@@ -117,14 +144,19 @@ struct PDDVideoForegroundCoordinator {
     ) async throws {
         try lease.validate()
         guard let armed = try await armer.arm(
-            uid: uid, messageID: candidate.messageID, candidate: candidate
+            uid: uid, messageID: candidate.messageID, candidate: candidate,
+            verifyNetworkPreview: {
+                try await PDDUIOperationContext.$lease.withValue(lease) {
+                    try await opener.confirmsNetworkCapture(candidate, lease: lease)
+                }
+            }
         ) else { return }
         var clicked = false
         var lastOpenError: Error?
         for _ in 0..<3 {
             do {
                 try lease.validate()
-                try await opener.open(candidate, lease: lease)
+                try await opener.open(candidate, lease: lease) { armed.checkpointNetworkBeforeClick() }
                 clicked = true
                 break
             } catch is CancellationError {
@@ -155,6 +187,7 @@ final class PDDVideoTransferArmer: PDDVideoTransferArming {
     typealias EventHandler = @Sendable (PDDVideoTransferEvent) async -> Void
 
     private let cefRoot: URL
+    private let networkLogURL: URL
     private let destinationRoot: URL
     private let watcher: PDDVideoCacheWatcher
     private let downloader: PDDUnlimitedVideoDownloadClient
@@ -169,6 +202,7 @@ final class PDDVideoTransferArmer: PDDVideoTransferArming {
         cefRoot: URL = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Containers/com.pinduoduo.merchantMac/PMDataRelease/Caches/cef"),
         destinationRoot: URL,
+        networkLogURL: URL = PDDVideoNetworkCapture.sessionLogURL,
         watcher: PDDVideoCacheWatcher = PDDVideoCacheWatcher(),
         downloader: PDDUnlimitedVideoDownloadClient = PDDUnlimitedVideoDownloadClient(),
         alternateDownloader: PDDAlternateVideoDownloadClient = PDDAlternateVideoDownloadClient(),
@@ -179,6 +213,7 @@ final class PDDVideoTransferArmer: PDDVideoTransferArming {
         eventHandler: @escaping EventHandler
     ) {
         self.cefRoot = cefRoot
+        self.networkLogURL = networkLogURL
         self.destinationRoot = destinationRoot
         self.watcher = watcher
         self.downloader = downloader
@@ -195,7 +230,8 @@ final class PDDVideoTransferArmer: PDDVideoTransferArming {
     func arm(
         uid: String,
         messageID: String,
-        candidate: PDDCustomerVideoCandidate
+        candidate: PDDCustomerVideoCandidate,
+        verifyNetworkPreview: @escaping PDDVideoPreviewVerification
     ) async throws -> ArmedPDDVideoTransfer? {
         let key = PDDVideoTransferKey(uid: uid, messageID: messageID)
         guard !(await registry.contains(key)) else { return nil }
@@ -211,8 +247,8 @@ final class PDDVideoTransferArmer: PDDVideoTransferArming {
             break
         }
         try await stateStore.transition(key: key, to: .opening)
-        let directories = try PDDVideoCacheLocator.findCacheDataDirectories(inCEFRoot: cefRoot)
-        let baselines = try PDDVideoCacheBaseline.capture(directories: directories)
+        let directories = (try? PDDVideoCacheLocator.findCacheDataDirectories(inCEFRoot: cefRoot)) ?? []
+        let baselines = (try? PDDVideoCacheBaseline.capture(directories: directories)) ?? []
         let transferDirectory = destinationRoot
             .appendingPathComponent("transfers", isDirectory: true)
             .appendingPathComponent(key.customerHash, isDirectory: true)
@@ -231,14 +267,44 @@ final class PDDVideoTransferArmer: PDDVideoTransferArming {
         let stateStore = self.stateStore
         let speechTranscriber = self.speechTranscriber
         let foregroundCompletion = PDDVideoForegroundCompletion()
-        let transferOperation: @Sendable () async -> Void = {
+        let transferOperation: @Sendable (PDDVideoNetworkCapture?) async -> Void = { networkCapture in
             await eventHandler(.init(
                 uid: uid, messageID: messageID, phase: .waitingForAddress
             ))
             do {
-                let sourceURL = try await withOperationDeadline(
-                    .seconds(30), stage: "video-address"
-                ) {
+                let networkLookup: (@MainActor @Sendable () async throws -> URL)?
+                if let networkCapture {
+                    networkLookup = {
+                        AutomationStepLog.record(root: saveRoot.deletingLastPathComponent(), uid: uid,
+                            step: "video-network-waiting", detail: "message_id=\(messageID)")
+                        let url: URL
+                        do {
+                            url = try await networkCapture.wait()
+                        } catch PDDVideoNetworkCapture.Failure.ambiguous {
+                            AutomationStepLog.record(root: saveRoot.deletingLastPathComponent(), uid: uid,
+                                step: "video-network-ambiguous", detail: "message_id=\(messageID)")
+                            throw PDDVideoNetworkCapture.Failure.ambiguous
+                        }
+                        try Task.checkCancellation()
+                        guard try await verifyNetworkPreview() else {
+                            AutomationStepLog.record(root: saveRoot.deletingLastPathComponent(), uid: uid,
+                                step: "video-network-chat-unverified", detail: "message_id=\(messageID)")
+                            throw PDDVideoNetworkCapture.Failure.unavailable
+                        }
+                        try Task.checkCancellation()
+                        guard await registry.claimSource(url, for: key) else {
+                            throw PDDVideoNetworkCapture.Failure.ambiguous
+                        }
+                        return url
+                    }
+                } else {
+                    networkLookup = nil
+                    AutomationStepLog.record(root: saveRoot.deletingLastPathComponent(), uid: uid,
+                        step: "video-network-log-unavailable", detail: "message_id=\(messageID)")
+                }
+                let match = try await PDDVideoAddressResolver.resolve(cache: {
+                    AutomationStepLog.record(root: saveRoot.deletingLastPathComponent(), uid: uid,
+                        step: "video-cache-waiting", detail: "message_id=\(messageID)")
                     let preloadedWindow = PDDAXSnapshotOrder.messageOrdinal(from: messageID)
                         .map { ordinal -> ClosedRange<Date> in
                             let messageDate = Date(
@@ -249,14 +315,18 @@ final class PDDVideoTransferArmer: PDDVideoTransferArming {
                     return try await watcher.wait(
                         in: baselines, preloadedWindow: preloadedWindow
                     ) { url in
-                        await registry.claimSource(url, for: key)
+                        guard (try? await verifyNetworkPreview()) == true, !Task.isCancelled else { return false }
+                        return await registry.claimSource(url, for: key)
                     }
-                }
+                }, network: networkLookup)
                 try Task.checkCancellation()
-                try await stateStore.transition(key: key, to: .addressCaptured)
+                let sourceURL = match.url
+                AutomationStepLog.record(root: saveRoot.deletingLastPathComponent(), uid: uid,
+                    step: "video-address-captured", detail: "message_id=\(messageID); source=\(match.source.rawValue)")
                 // Only address capture needs the foreground preview. Download,
                 // validation and evidence processing continue independently.
                 await foregroundCompletion.finish()
+                try await stateStore.transition(key: key, to: .addressCaptured)
                 try await stateStore.recordAttempt(key: key)
                 await eventHandler(.init(uid: uid, messageID: messageID, phase: .downloading))
                 try await stateStore.transition(key: key, to: .downloading)
@@ -323,9 +393,10 @@ final class PDDVideoTransferArmer: PDDVideoTransferArming {
             }
         }
         return ArmedPDDVideoTransfer(
-            onStart: {
+            networkLogURL: networkLogURL,
+            onStart: { networkCapture in
                 Task {
-                    let started = await registry.start(key: key, operation: transferOperation)
+                    let started = await registry.start(key: key) { await transferOperation(networkCapture) }
                     if !started { await foregroundCompletion.finish() }
                 }
             },

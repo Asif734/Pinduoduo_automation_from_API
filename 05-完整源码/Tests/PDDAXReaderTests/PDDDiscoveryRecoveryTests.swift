@@ -431,6 +431,69 @@ final class PDDDiscoveryRecoveryTests: XCTestCase {
         XCTAssertTrue(backend.writes.isEmpty)
     }
 
+    func testVerifiedTextCaptureQueuesGenerationBeforeOtherChatsAndRunsAlongsideTheirJobs() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = InvestigationPDD()
+        let clock = InvestigationClock()
+        let (conversation, newUID, readyUID) = try setup(root, backend: backend, clock: clock)
+        let olderMessage = investigationMessage("oldA")
+        let order = PDDChatMessage(id: "middlePanel_list_order", sender: .customer, content: "order card",
+            displayTime: nil, kind: .link, capturedAt: clock.date)
+        let question = investigationMessage("newA")
+        let inbox = PDDVerifiedCaptureInbox(root: root)
+        try inbox.stage(uid: newUID, locator: .init(nickname: "A***"),
+            messages: [olderMessage, order, question],
+            snapshot: investigationTree(activeA: true, ids: ["oldA", "order", "newA"]).rootSnapshot,
+            unread: true, at: clock.date)
+
+        let readyJob = try investigationJob(uid: readyUID, sequence: 1, state: .ready)
+        let otherJob = try investigationJob(uid: "PDD-other-generation", sequence: 2, state: .queued)
+        let cursor = try AutoReplyTimeline.make(messages: [olderMessage]).cursor
+        var state = AutoReplyPersistentState.empty
+        state.jobs = [readyJob, otherJob]
+        state.nextSequence = 2
+        state.answeredCursors = [newUID: cursor]
+        state.axFirstBaselinedUIDs = [newUID]
+        state.pendingCaptureRequests = [
+            .init(uid: "PDD-older-retry", kind: .tail, baseCursor: .empty, nextAttemptAt: clock.date),
+            .init(uid: newUID, kind: .ordinary, baseCursor: cursor)
+        ]
+        let store = AutoReplyStore(rootDirectory: root)
+        try store.save(state)
+        backend.failReads = true
+        let driver = PDDLiveAutoReplyDriver(conversationDriver: conversation,
+            sender: PDDAXReplySender(backend: backend, opener: conversation, pollIntervalNanoseconds: 0))
+        let scheduler = try AutoReplyScheduler(driver: driver, generator: PendingInvestigationGenerator(),
+            store: store, configuredMaximumConcurrentGenerations: 2, availableMemoryBytes: { 16 << 30 },
+            now: { clock.date })
+        scheduler.start()
+        defer { scheduler.stop() }
+
+        await scheduler.tick()
+
+        let queued = try XCTUnwrap(scheduler.jobs.first { $0.uid == newUID })
+        XCTAssertEqual(queued.state, .queued)
+        XCTAssertEqual(queued.capture.batch?.customerMessageIDs, [order.id, question.id])
+        XCTAssertEqual(scheduler.jobs.first { $0.uid == readyUID }?.state, .ready)
+        XCTAssertEqual(backend.reads, 0, "A verified text capture does not reopen PDD")
+        XCTAssertEqual(try store.load().pendingCaptureRequests.map(\.uid), ["PDD-older-retry"])
+
+        await scheduler.tick()
+
+        XCTAssertEqual(Set(scheduler.jobs.filter { $0.state == .generating }.map(\.uid)), [newUID, otherJob.uid])
+    }
+
+    private func investigationJob(uid: String, sequence: Int, state: AutoReplyJobState) throws -> AutoReplyJob {
+        let messages = [investigationMessage(uid)]
+        let timeline = try AutoReplyTimeline.make(messages: messages)
+        let capture = AutoReplyCapture(uid: uid, fullHistory: messages, batch: try timeline.freeze(after: .empty),
+            customerCursor: timeline.cursor, unexpectedServiceMessageIDs: [])
+        return AutoReplyJob(id: UUID(), uid: uid, sequence: sequence, state: state, capture: capture,
+            reply: state == .ready ? "ready reply" : nil, deliveryOutcome: nil, confirmedServiceMessageID: nil,
+            retries: 0, nextAttemptAt: nil, lastError: nil)
+    }
+
     func testComposerCannotEndSelectionReadinessBeforeHistoryAppears() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -454,19 +517,25 @@ final class PDDDiscoveryRecoveryTests: XCTestCase {
         XCTAssertNotNil(try PDDVerifiedCaptureInbox(root: root).load(uid: a))
     }
 
-    func testStagedImageCannotUseOldAXTokensOrDegradeOnLiveReadFailure() async throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        defer { try? FileManager.default.removeItem(at: root) }
-        let backend = InvestigationPDD(); let (driver, a, _) = try setup(root, backend: backend, clock: InvestigationClock())
-        let image = PDDChatMessage(id: "middlePanel_list_image", sender: .customer, content: "[图片]", displayTime: nil, kind: .image, capturedAt: Date())
-        let inbox = PDDVerifiedCaptureInbox(root: root)
-        try inbox.stage(uid: a, locator: .init(nickname: "A***"), messages: [investigationMessage("oldA"), image],
-            snapshot: investigationTree(activeA: true, ids: ["oldA"]).rootSnapshot, unread: true, at: Date())
-        backend.failReads = true
-        let cursor = try AutoReplyTimeline.make(messages: [investigationMessage("oldA")]).cursor
-        do { _ = try await driver.capture(uid: a, after: cursor); XCTFail("Media needs verified live controls") } catch {}
-        XCTAssertNotNil(try inbox.load(uid: a))
-        XCTAssertTrue(backend.writes.isEmpty)
+    func testStagedMediaRequiresLiveCaptureEvenWithTextInTheBatch() async throws {
+        for kind in [ChatContentKind.image, .video] {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let backend = InvestigationPDD()
+            let (driver, a, _) = try setup(root, backend: backend, clock: InvestigationClock())
+            let media = PDDChatMessage(id: "middlePanel_list_media", sender: .customer, content: "[media]",
+                displayTime: nil, kind: kind, capturedAt: Date())
+            let inbox = PDDVerifiedCaptureInbox(root: root)
+            try inbox.stage(uid: a, locator: .init(nickname: "A***"),
+                messages: [investigationMessage("oldA"), investigationMessage("newA"), media],
+                snapshot: investigationTree(activeA: true, ids: ["oldA"]).rootSnapshot, unread: true, at: Date())
+            backend.failReads = true
+            let cursor = try AutoReplyTimeline.make(messages: [investigationMessage("oldA")]).cursor
+            XCTAssertTrue(driver.verifiedTextCaptureUIDs(after: [a: cursor]).isEmpty)
+            do { _ = try await driver.capture(uid: a, after: cursor); XCTFail("Media needs verified live controls") } catch {}
+            XCTAssertNotNil(try inbox.load(uid: a))
+            XCTAssertTrue(backend.writes.isEmpty)
+        }
     }
 
     func testInboxKeepsEveryObservationAndCorruptOtherCustomerIsIsolated() throws {
@@ -501,6 +570,7 @@ final class PDDDiscoveryRecoveryTests: XCTestCase {
         let discoveries = try await driver.discover()
         XCTAssertEqual(discoveries.first?.uid, a)
         let cursor = try AutoReplyTimeline.make(messages: [investigationMessage("oldA")]).cursor
+        XCTAssertEqual(driver.verifiedTextCaptureUIDs(after: [a: cursor]), [a])
         let capture = try await driver.capture(uid: a, after: cursor)
         XCTAssertEqual(capture.batch?.customerMessageIDs, ["middlePanel_list_newA"])
         try driver.acknowledgeDiscoveryCapture(capture)
@@ -652,6 +722,13 @@ final class PDDDiscoveryRecoveryTests: XCTestCase {
         let found = try await driver.discover()
         XCTAssertTrue(found.isEmpty)
         XCTAssertNil(try PDDPendingDiscoveryStore(root: root).load().first?.resolvedUID)
+    }
+}
+
+private struct PendingInvestigationGenerator: AutoReplyGenerating {
+    func generate(_ capture: AutoReplyCapture) async throws -> CodexReplyResult {
+        try await Task.sleep(for: .seconds(30))
+        throw CancellationError()
     }
 }
 

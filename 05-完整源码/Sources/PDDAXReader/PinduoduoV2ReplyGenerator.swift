@@ -121,26 +121,8 @@ struct PinduoduoV2ReplyGenerator: DurableJobAutoReplyGenerating, AutoReplyGenera
                     record.phase = .completed
                     record.result = receipt
                     try store.save(record)
-                    var finishedReply = reply.replyText
-                    if let violation = CustomerFacingReplyPolicy.violation(in: finishedReply) {
-                        let targetIDs = capture.batch?.customerMessageIDs ?? []
-                        let targets = capture.fullHistory.filter { targetIDs.contains($0.id) }
-                        // Fallbacks scan from the end: prefer identifiable target
-                        // language, then retain context for media-only/unclear input.
-                        let languageHistory = capture.fullHistory + targets
-                        if action == .replyThenTransfer {
-                            finishedReply = CustomerFacingFallback.handoff(history: languageHistory)
-                        } else if violation == "video processing status" {
-                            finishedReply = CustomerFacingFallback.videoQuestion(history: languageHistory)
-                        } else {
-                            finishedReply = CustomerFacingFallback.productProblemQuestion(history: languageHistory)
-                        }
-                        AutomationStepLog.record(root: rootDirectory, uid: capture.uid,
-                            step: "hosted-generation-wording-completed",
-                            detail: "job=\(jobID); \(violation); neutral wording produced during generation; action and result binding preserved")
-                    }
                     return CodexReplyResult(
-                        reply: finishedReply,
+                        reply: reply.replyText,
                         threadID: hostedJobID,
                         action: action,
                         transferReason: transferReason,

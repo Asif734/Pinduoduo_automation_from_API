@@ -39,6 +39,7 @@ protocol AutoReplyAutomationDriver: AnyObject {
               expectedCustomerCursor: AutoReplyCursor, expectedCustomerMessageIDs: Set<String>,
               lease: UIOperationLease) async throws -> AutoReplyDeliveryResult
     func discover() async throws -> [AutoReplyDiscovery]
+    func verifiedTextCaptureUIDs(after cursors: [String: AutoReplyCursor]) -> Set<String>
     func capture(uid: String, after cursor: AutoReplyCursor) async throws -> AutoReplyCapture
     func preflight(uid: String, after cursor: AutoReplyCursor) async throws -> AutoReplyCapture?
     func send(
@@ -112,6 +113,7 @@ extension AutoReplyAutomationDriver {
     func acknowledgeDiscoveryCapture(_ capture: AutoReplyCapture) throws {}
     func reconcileVisibleIdentity(in tree: PDDAXSemanticTree) throws {}
     func visibleConversationsSnapshot() -> [PDDConversationLocator]? { nil }
+    func verifiedTextCaptureUIDs(after cursors: [String: AutoReplyCursor]) -> Set<String> { [] }
     func send(uid: String, text: String, outgoingImages: [DatasetReplyImage], deliveryID: UUID,
               expectedCustomerCursor: AutoReplyCursor, expectedCustomerMessageIDs: Set<String>,
               lease: UIOperationLease) async throws -> AutoReplyDeliveryResult {
@@ -284,6 +286,7 @@ final class AutoReplyScheduler: ObservableObject {
     private var workTurnsSinceDiscovery = 0
     private var nextWorkLane = 0
     private var lastTurnWasTail = false
+    private var lastTurnWasVerifiedTextCapture = false
     private var consecutiveSendTurns = 0
     private var lastDiscoveryAt = Date.distantPast
     private var pendingFastDiscoveryAttempts = 0
@@ -850,6 +853,17 @@ final class AutoReplyScheduler: ObservableObject {
                 try persist()
                 return
             }
+
+            // A staged text capture can queue generation without another chat read.
+            // Yield after one so a stream of new arrivals leaves turns for delivery and media.
+            if !lastTurnWasVerifiedTextCapture, let request = nextVerifiedTextCaptureRequest() {
+                lastTurnWasVerifiedTextCapture = true
+                consecutiveSendTurns = 0
+                workTurnsSinceDiscovery += 1
+                try await capture(request: request)
+                return
+            }
+            lastTurnWasVerifiedTextCapture = false
 
             // Ready answers precede routine tail/reconciliation/capture work.
             // After two send attempts, yield one maintenance turn when available.
@@ -1565,6 +1579,7 @@ final class AutoReplyScheduler: ObservableObject {
             .filter { taskIndex in
                 let task = state.transferTasks[taskIndex]
                 let source = state.jobs.first { $0.id == task.sourceJobID }
+                // A completed send attempt can still have an uncertain delivery receipt.
                 return source?.state == (task.hostedFailureCode == nil ? .completed : .quarantined)
             }
             .min {
@@ -1816,7 +1831,7 @@ final class AutoReplyScheduler: ObservableObject {
             if state.jobs[index].replyAction == .replyThenTransfer {
                 state.jobs[index].state = .completed
                 state.jobs[index].deliveryOutcome = .notSent
-                state.jobs[index].lastError = "客套回复尝试一次后未发送：\(reason)；转人工任务不受影响"
+                state.jobs[index].lastError = "回复尝试一次后未发送：\(reason)；转人工任务不受影响"
                 state.jobs[index].nextAttemptAt = nil
                 state.jobs[index].durableAttemptOperationID = nil
                 state.jobs[index].sendWasInvoked = false
@@ -2051,7 +2066,7 @@ final class AutoReplyScheduler: ObservableObject {
         var terminalHostedCode: String?
         switch result {
         case .success(let generated):
-            state.jobs[index].reply = CustomerFacingReplyPolicy.preparedForPinduoduo(generated.reply)
+            state.jobs[index].reply = generated.reply
             if state.jobs[index].lastError == PinduoduoV2ClientError.recoveryPending.errorDescription {
                 state.jobs[index].lastError = nil
                 state.jobs[index].nextAttemptAt = nil
@@ -2061,7 +2076,7 @@ final class AutoReplyScheduler: ObservableObject {
             state.jobs[index].transferReason = generated.transferReason
             state.jobs[index].hostedGeneration = generated.hostedGeneration
             state.jobs[index].generationDiagnostic = generated.diagnostic
-            if state.jobs[index].capture.batch?.incomingHandoffKey != nil {
+            if generated.hostedGeneration == nil, state.jobs[index].capture.batch?.incomingHandoffKey != nil {
                 state.jobs[index].replyAction = .reply
                 state.jobs[index].transferReason = .none
             }
@@ -2186,6 +2201,29 @@ final class AutoReplyScheduler: ObservableObject {
             kind: "codex-failure-transfer",
             detail: "\(reason)；已生成客套回复并建立独立转人工任务"
         )
+    }
+
+    private func nextVerifiedTextCaptureRequest() -> AutoReplyCaptureRequest? {
+        let candidates = state.pendingCaptureRequests.indices.filter { index in
+            let request = state.pendingCaptureRequests[index]
+            let uid = request.uid
+            return request.kind == .ordinary && request.nextAttemptAt == nil
+                && ordinaryCaptureAuthorizations.contains(uid) && ordinaryCaptureFailureCounts[uid] == nil
+                && !hasActiveJob(uid: uid) && !identityRecoveryBlockedUIDs.contains(uid)
+                && !PDDConversationIdentityStore.isSharedVisitorUID(uid)
+        }
+        guard !candidates.isEmpty else { return nil }
+        let cursors = Dictionary(candidates.map { index in
+            let uid = state.pendingCaptureRequests[index].uid
+            return (uid, answeredCursor(uid))
+        }, uniquingKeysWith: { first, _ in first })
+        let verified = driver.verifiedTextCaptureUIDs(after: cursors)
+        guard let index = candidates.first(where: { verified.contains(state.pendingCaptureRequests[$0].uid) }) else {
+            return nil
+        }
+        let request = state.pendingCaptureRequests.remove(at: index)
+        ordinaryCaptureAuthorizations.remove(request.uid)
+        return request
     }
 
     private func nextCaptureRequest() -> AutoReplyCaptureRequest? {
@@ -3392,7 +3430,7 @@ final class AutoReplyScheduler: ObservableObject {
         ))
         appendEvent(
             uid: job.uid, kind: "transfer-task-created",
-            detail: "独立转人工任务已入队；不依赖客套回复发送结果"
+            detail: "转人工任务已入队；先尝试发送回复，发送结果待核对时仍可转接"
         )
     }
 

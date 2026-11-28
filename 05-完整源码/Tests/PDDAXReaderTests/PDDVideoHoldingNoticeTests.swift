@@ -10,7 +10,8 @@ final class PDDVideoHoldingNoticeTests: XCTestCase {
         }
         await f.capture()
         await f.ticks(10)
-        XCTAssertEqual(f.driver.sent, ["请问您的产品遇到了什么问题？麻烦您描述一下具体表现，我来帮您排查。"])
+        XCTAssertEqual(f.driver.sent.count, 1)
+        XCTAssertTrue(CustomerFacingFallback.productProblemQuestions.contains(try XCTUnwrap(f.driver.sent.first)))
         XCTAssertTrue(f.scheduler.pendingVideoBatchesSnapshot.isEmpty)
     }
 
@@ -21,7 +22,8 @@ final class PDDVideoHoldingNoticeTests: XCTestCase {
         await f.ticks(10)
         let captures = await f.generator.captures
         XCTAssertTrue(captures.isEmpty)
-        XCTAssertEqual(f.driver.sent, ["请问您的产品遇到了什么问题？麻烦您描述一下具体表现，我来帮您排查。"])
+        XCTAssertEqual(f.driver.sent.count, 1)
+        XCTAssertTrue(CustomerFacingFallback.productProblemQuestions.contains(try XCTUnwrap(f.driver.sent.first)))
     }
 
     func testFailedVideoAsksProductProblemOnceThenWaitsForCustomerAcrossRestart() async throws {
@@ -31,7 +33,8 @@ final class PDDVideoHoldingNoticeTests: XCTestCase {
             await f.scheduler.receiveVideoTransferEvent(.init(uid: "customer", messageID: "video", phase: phase))
         }
         await f.ticks(8)
-        XCTAssertEqual(f.driver.sent, ["请问您的产品遇到了什么问题？麻烦您描述一下具体表现，我来帮您排查。"])
+        XCTAssertEqual(f.driver.sent.count, 1)
+        XCTAssertTrue(CustomerFacingFallback.productProblemQuestions.contains(try XCTUnwrap(f.driver.sent.first)))
         XCTAssertEqual(f.scheduler.jobs.first?.state, .completed)
         XCTAssertTrue(f.scheduler.pendingVideoBatchesSnapshot.isEmpty)
         XCTAssertNotNil(try CustomerMessageReceipts(root: f.root).receipts(uid: "customer")["video"]?.replySentAt)

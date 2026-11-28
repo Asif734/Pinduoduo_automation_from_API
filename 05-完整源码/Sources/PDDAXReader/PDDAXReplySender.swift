@@ -225,10 +225,11 @@ final class PDDAXReplySender {
         }
     }
 
-    private func sendReply(uid: String, text: String, expectedCustomerCursor: AutoReplyCursor,
+    private func sendReply(uid: String, text reply: String, expectedCustomerCursor: AutoReplyCursor,
                            expectedCustomerMessageIDs: Set<String>, deliveryID: UUID?) async throws -> AutoReplyDeliveryResult {
-        let reply = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !reply.isEmpty else { return .failedBeforeSend("回复为空") }
+        guard !reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return .failedBeforeSend("回复为空")
+        }
         let attempts = logRoot.map { PDDTextDeliveryAttemptStore(root: $0) }
         if let deliveryID, let attempts, let previous = try attempts.load(deliveryID) {
             if previous.mayHaveSent {

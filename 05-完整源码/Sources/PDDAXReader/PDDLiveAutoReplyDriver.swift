@@ -6,6 +6,7 @@ protocol PDDLiveConversationDriving: AnyObject {
     func reconcileVisibleIdentity(in tree: PDDAXSemanticTree) throws
     func visibleConversationsSnapshot() -> [PDDConversationLocator]?
     func discover() async throws -> [AutoReplyDiscovery]
+    func verifiedTextCaptureUIDs(after cursors: [String: AutoReplyCursor]) -> Set<String>
     func capture(uid: String, after cursor: AutoReplyCursor) async throws -> AutoReplyCapture
     func capture(
         uid: String, after cursor: AutoReplyCursor, lease: UIOperationLease
@@ -35,6 +36,7 @@ extension PDDLiveConversationDriving {
     func acknowledgeDiscoveryCapture(_ capture: AutoReplyCapture) throws {}
     func reconcileVisibleIdentity(in tree: PDDAXSemanticTree) throws {}
     func visibleConversationsSnapshot() -> [PDDConversationLocator]? { nil }
+    func verifiedTextCaptureUIDs(after cursors: [String: AutoReplyCursor]) -> Set<String> { [] }
     func capture(
         uid: String, after cursor: AutoReplyCursor, includeImages: Bool,
         onlyVideoMessageID: String?, lease: UIOperationLease
@@ -137,6 +139,10 @@ final class PDDLiveAutoReplyDriver: AutoReplyAutomationDriver {
 
     func discover() async throws -> [AutoReplyDiscovery] {
         try await conversationDriver.discover()
+    }
+
+    func verifiedTextCaptureUIDs(after cursors: [String: AutoReplyCursor]) -> Set<String> {
+        conversationDriver.verifiedTextCaptureUIDs(after: cursors)
     }
 
     func capture(uid: String, after cursor: AutoReplyCursor) async throws -> AutoReplyCapture {

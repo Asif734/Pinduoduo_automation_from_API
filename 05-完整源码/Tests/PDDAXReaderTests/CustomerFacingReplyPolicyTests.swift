@@ -2,14 +2,31 @@ import XCTest
 @testable import PDDAXReader
 
 final class CustomerFacingReplyPolicyTests: XCTestCase {
-    func testVideoFailureAsksAboutProductProblemInCustomerLanguage() {
-        let english = [PDDChatMessage(id: "q", sender: .customer, content: "Hello, I need help with my printer.",
+    func testProductProblemFallbackUsesChineseWithEnglishCustomerHistory() {
+        let history = [PDDChatMessage(id: "q", sender: .customer, content: "Hello, I need help with my printer.",
             displayTime: nil, kind: .text, capturedAt: Date())]
-        let reply = CustomerFacingFallback.productProblemQuestion(history: english)
-        XCTAssertEqual(reply, "What problem are you having with the product? Please describe what happens so I can help you troubleshoot.")
+
+        let reply = CustomerFacingFallback.productProblemQuestion(history: history)
+
+        XCTAssertNotNil(reply.range(of: #"\p{Han}"#, options: .regularExpression))
         XCTAssertNil(CustomerFacingReplyPolicy.violation(in: reply))
-        XCTAssertEqual(CustomerFacingFallback.productProblemQuestion(history: []),
-            "请问您的产品遇到了什么问题？麻烦您描述一下具体表现，我来帮您排查。")
+    }
+
+    func testProductProblemFallbackHasElevenDistinctChineseQuestions() {
+        let questions = CustomerFacingFallback.productProblemQuestions
+        XCTAssertEqual(Set(questions).count, 11)
+        for question in questions {
+            XCTAssertNotNil(question.range(of: #"\p{Han}"#, options: .regularExpression))
+            XCTAssertNil(CustomerFacingReplyPolicy.violation(in: question))
+        }
+    }
+
+    func testProductProblemFallbackAvoidsRepeatingLastVisibleQuestion() {
+        let previous = CustomerFacingFallback.productProblemQuestion(history: [])
+        let history = [PDDChatMessage(id: "fallback", sender: .service, content: previous,
+            displayTime: nil, kind: .text, capturedAt: Date())]
+
+        XCTAssertNotEqual(CustomerFacingFallback.productProblemQuestion(history: history), previous)
     }
 
     func testVideoProcessingStatusIsBlockedButSpecificEvidenceLimitsAndChineseHoldsAreAllowed() {
